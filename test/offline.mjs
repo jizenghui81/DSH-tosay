@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cleanForSpeech, truncateForSpeech } from '../lib/clean.js';
-import { PRIORITY, closerFor, createSessionState, drain, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage } from '../lib/activity.js';
+import { PRIORITY, closerFor, createSessionState, drain, formatDuration, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage, waitingLine } from '../lib/activity.js';
 import { ruleSummary, buildPrompt } from '../lib/summarize.js';
 import { buildSpawnSpec, buildSpeechArgv, createSpeechEngine, resolveEnginePath } from '../lib/engine.js';
 import { composeAnnouncement, expandHome, readField, resolveConfig } from '../lib/index.js';
@@ -913,29 +913,39 @@ await test('回归（端到端）：心跳抽干计数后，收尾播报里收�
   ctx.disposeAll();
 });
 
-await test('审计留痕：announce 行第 4 字段标出摘要来源（llm / rule / closer-only）', async () => {
+await test('审计留痕：announce 行第 4 字段标出来源（llm / rule / closer-only / fact）', async () => {
   const cases = [
-    { name: 'llm', llm: fakeLlm({ text: '改了三个文件。' }), events: 'worked', want: 'llm' },
-    { name: 'rule', llm: fakeLlm({ fail: true }), events: 'worked', want: 'rule' },
-    { name: 'closer-only', llm: fakeLlm(), events: 'chat', want: 'closer-only' },
+    { name: 'llm', llm: fakeLlm({ text: '改了三个文件。' }), events: 'worked', reason: 'turn-end', want: 'llm' },
+    { name: 'rule', llm: fakeLlm({ fail: true }), events: 'worked', reason: 'turn-end', want: 'rule' },
+    { name: 'closer-only', llm: fakeLlm(), events: 'chat', reason: 'turn-end', want: 'closer-only' },
+    // 事实型：等模型长生成期间的心跳，不调摘要模型
+    { name: 'fact', llm: fakeLlm(), events: 'waiting', reason: 'progress-heartbeat', want: 'fact' },
   ];
   for (const item of cases) {
     const logFile = path.join(os.tmpdir(), `dspeak-src-${item.name}-${process.pid}-${Date.now()}.log`);
     try {
       const subprocess = fakeSubprocess();
       const ctx = fakeCtx({ subprocess, llm: item.llm });
-      apply(ctx, { throttleMs: 0, minGapMs: 0, announceKickoff: false, silenceHeartbeatMs: 0, logFile });
+      apply(ctx, {
+        throttleMs: 0, minGapMs: 0, announceKickoff: false, logFile,
+        // 等待态用例需要心跳活着；其余用例关掉心跳避免噪声
+        silenceHeartbeatMs: item.events === 'waiting' ? 200 : 0,
+      });
       const session = fakeSession();
       ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
       if (item.events === 'worked') {
         ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
       }
-      ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
-      await tick(300);
+      if (item.events === 'waiting') {
+        ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } });
+      } else {
+        ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+      }
+      await tick(500);
       const announces = fs.readFileSync(logFile, 'utf8').trim().split('\n')
         .map((line) => line.split('\t'))
-        .filter((parts) => parts[1] === 'announce' && parts[2] === 'turn-end');
-      assert.equal(announces.length, 1, `${item.name}：应有一条 turn-end 播报`);
+        .filter((parts) => parts[1] === 'announce' && parts[2] === item.reason);
+      assert.equal(announces.length, 1, `${item.name}：应有一条 ${item.reason} 播报`);
       assert.equal(announces[0][4], item.want, `${item.name}：来源字段错误（${announces[0].join(' | ')}）`);
       ctx.disposeAll();
     } finally {
@@ -1037,16 +1047,20 @@ await test('回归 187s 静默：长工具调用飞行期内，缓冲被 drain �
   });
   await tick(900);                          // 第一次心跳：来自缓冲里的那条 tool/call
   const afterFirst = subprocess.calls.length;
+  const llmCallsAfterFirst = llm.seen.length;
   assert.ok(afterFirst >= 1, '第一次心跳应播');
+  assert.equal(llmCallsAfterFirst, 1, '第一次有真实缓冲内容，应走摘要模型');
   // 关键：此后不再产生任何会话事件，完全复刻 sleep 飞行期
   await tick(900);
   assert.ok(
     subprocess.calls.length > afterFirst,
     `缓冲被抽干后，长调用的飞行期仍必须报心跳（旧代码在这里整段静默）：${subprocess.calls.length}`,
   );
-  const prompt = llm.seen.at(-1).messages[0].content[0].text;
-  assert.ok(prompt.includes('仍在执行'), `摘要必须拿到"在飞调用"这条如实描述：${prompt}`);
-  assert.ok(prompt.includes('sleep 180'), `描述里要带上真正在跑的命令：${prompt}`);
+  // v1.4.0：事实型心跳**不走摘要模型**，直接念那条如实描述（零编造 + 零延迟）
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+  assert.ok(spoken.includes('仍在执行'), `应说清还在跑什么：${spoken}`);
+  assert.ok(spoken.includes('sleep 180'), `应带上真正在跑的命令：${spoken}`);
+  assert.equal(llm.seen.length, llmCallsAfterFirst, '事实型心跳不该再调摘要模型');
   ctx.disposeAll();
 });
 
@@ -1105,10 +1119,117 @@ await test('在飞调用：描述如实带出"在跑什么 + 等了多久 + 并�
   const line = pendingWorkLine(s, s.inFlightCalls[0].at + 178000);
   assert.ok(line.includes('仍在执行'), `应说清还在跑：${line}`);
   assert.ok(line.includes('sleep 180'), `应带上真正在跑的命令：${line}`);
-  assert.ok(line.includes('178 秒'), `应如实报等待时长：${line}`);
+  assert.ok(line.includes('2 分 58 秒'), `等这么久要念成口语时长，不能报"178 秒"：${line}`);
   noteEvent(s, { type: 'tool/call', data: { callId: 'b', name: 'web_fetch' } }, {});
   assert.ok(pendingWorkLine(s, s.inFlightCalls[0].at).includes('另有 1 个调用同时在跑'), '并发时要说明还有别的在跑');
   assert.equal(pendingWorkLine(createSessionState('empty')), '', '没有在飞调用时返回空串');
+});
+
+// ── 长生成期间的播报（v1.4.0；节奏方案「丁」）────────────────────────────
+// 官方定义：`step/start` = **一次模型调用 + 它请求的工具执行**。所以从 step/start 到
+// assistant/message 之间主机确定处在一次模型调用中，而这整段**零会话事件**。
+// 重放 33 个真实会话 / 393 段 >60s 静默：这类静默 **44 段 / 5,258 秒**
+// （中位 92 秒、最长 323 秒）；而"完全没有任何状态可报"的真空段是 **0 段** —— 故不做时间兜底。
+
+await test('formatDuration：时长要念成口语，不能报裸秒数', () => {
+  assert.equal(formatDuration(30000), '30 秒');
+  assert.equal(formatDuration(92000), '1 分 32 秒');
+  assert.equal(formatDuration(120000), '2 分钟');
+  assert.equal(formatDuration(323000), '5 分 23 秒');
+  assert.equal(formatDuration(-5), '0 秒');
+});
+
+await test('等模型：step/start 之后进入等待态，话术只陈述事实', () => {
+  const s = createSessionState('s');
+  noteEvent(s, { type: 'turn/start', data: { turn: 1 } }, {});
+  assert.equal(waitingLine(s), '', '还没开工时不该报"在等模型"');
+  noteEvent(s, { type: 'step/start', data: { turn: 1, step: 1 } }, {});
+  assert.equal(s.waitingKind, 'model');
+  assert.equal(waitingLine(s, s.waitingSince + 130000), '还在等模型返回，已经 2 分 10 秒。');
+});
+
+await test('等模型：五类结束事件都要清位（否则会一直误报"还在等"）', () => {
+  const cases = [
+    ['assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: '好了。' }] } }],
+    ['tool/call', { callId: 'c1', name: 'bash' }],
+    ['step/end', { turn: 1, step: 1 }],
+    ['assistant/attempt', { turn: 1, step: 1, stream: [] }],
+    ['turn/end', { turn: 1, reason: { kind: 'completed' } }],
+  ];
+  for (const [type, data] of cases) {
+    const s = createSessionState('s');
+    noteEvent(s, { type: 'turn/start', data: { turn: 1 } }, {});
+    noteEvent(s, { type: 'step/start', data: { turn: 1, step: 1 } }, {});
+    assert.equal(s.waitingKind, 'model', `${type} 之前应处于等模型`);
+    noteEvent(s, { type, data }, {});
+    assert.equal(s.waitingKind, '', `${type} 之后必须清位`);
+  }
+});
+
+await test('等模型：重试与上下文压缩也算"在干活"，各有如实文案', () => {
+  const s = createSessionState('s');
+  noteEvent(s, { type: 'turn/start', data: { turn: 1 } }, {});
+  noteEvent(s, { type: 'compaction/start', data: {} }, {});
+  assert.equal(s.waitingKind, 'compaction');
+  assert.equal(waitingLine(s, s.waitingSince + 90000), '正在压缩上下文，已经 1 分 30 秒。');
+  noteEvent(s, { type: 'compaction/end', data: {} }, {});
+  assert.equal(s.waitingKind, '', '压缩结束要清位（其后紧跟的 step/start 会重新进入）');
+  noteEvent(s, { type: 'llm/retry-started', data: {} }, {});
+  assert.ok(waitingLine(s, s.waitingSince + 5000).startsWith('还在等模型返回'), '重试仍是等模型');
+});
+
+await test('等模型（端到端）：长生成期间必须出声，且不调摘要模型', async () => {
+  const subprocess = fakeSubprocess();
+  const llm = fakeLlm({ text: '这句不该被用到。' });
+  const ctx = fakeCtx({ subprocess, llm });
+  apply(ctx, HCFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  // 复刻真实时序：模型调用打开，然后长时间音信全无
+  ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } });
+  await tick(800);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+  assert.ok(spoken.includes('还在等模型返回'), `长生成期间必须出声：${JSON.stringify(spoken)}`);
+  assert.equal(llm.seen.length, 0, '事实型播报不调模型：零编造风险，也省一次往返');
+  ctx.disposeAll();
+});
+
+await test('等模型续报下限（方案丁）：下限内不重复，越过下限仍会续报', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
+  apply(ctx, { ...HCFG, modelWaitMinGapMs: 900 }); // 默认 60000，这里用可测的小值
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } });
+  await tick(700); // 首次：走共用的 silenceHeartbeatMs 阈值
+  const first = subprocess.calls.length;
+  assert.equal(first, 1, '应先报一次');
+  await tick(200); // 距上次播报 500ms < 900ms 下限
+  assert.equal(subprocess.calls.length, first, '下限内不得重复播报');
+  await tick(1000); // 越过下限
+  assert.ok(subprocess.calls.length > first, '越过下限后必须续报，否则又变回沉默');
+  ctx.disposeAll();
+});
+
+await test('事实型播报的守卫：期间若来了新事件，改走摘要而不念那句可能已过时的话', async () => {
+  const subprocess = fakeSubprocess();
+  const llm = fakeLlm({ text: '刚生成完一段回复。' });
+  const ctx = fakeCtx({ subprocess, llm });
+  apply(ctx, { ...HCFG, throttleMs: 400 });
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } });
+  await tick(500); // tick(400) 已判定出心跳，flush 排在 800
+  ctx.emit('session/event', session, {
+    type: 'assistant/message',
+    data: { message: { role: 'assistant', content: [{ type: 'text', text: '做完了。' }] } },
+  });
+  await tick(400);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+  assert.equal(llm.seen.length, 1, '缓冲里有新内容时应走摘要模型');
+  assert.ok(spoken.includes('刚生成完一段回复'), `应念摘要：${spoken}`);
+  assert.ok(!spoken.includes('还在等模型返回'), '不该再念那句已经过时的事实描述');
+  ctx.disposeAll();
 });
 
 await test('静默心跳守卫：轮次已结束不报', async () => {

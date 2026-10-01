@@ -32,8 +32,11 @@
         # 任务短于此字数不念（如"继续"）
         kickoffMinTaskChars: 4
         # 静默心跳：本轮进行中且这么久没播报就报一次进展（0 = 关闭）
-        # ⚠️ 期间必须确实有活动才报 —— 真卡住时不报，绝不编造"正在努力工作"
+        # ⚠️ "有活动"现在包括两类：工具在飞、正在等模型返回（step/start 之后还没出消息）
+        #    真卡住（三者皆无）时不报，绝不编造"正在努力工作"
         silenceHeartbeatMs: 30000
+        # 「等模型返回」类续报的 60 秒下限 —— 内部项，**不出现在设置页**，一般不用改
+        modelWaitMinGapMs: 60000
         announceTodoCompleted: true
         announceApprovals: true
         announceGoalChange: false

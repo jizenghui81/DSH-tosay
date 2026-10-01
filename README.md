@@ -85,7 +85,8 @@ There are two entry points for changes, and both write the same configuration: t
 | `announceKickoff` | `true` | Kickoff feedback: on receiving a new task, immediately say "got it + here's how I'll approach it" |
 | `kickoffThrottleMs` | `400` | Dedicated short throttle window for kickoff feedback — "immediately" must not be dragged down by the default 2500ms |
 | `kickoffMinTaskChars` | `4` | Tasks shorter than this character count are not spoken (e.g. "continue") |
-| `silenceHeartbeatMs` | `30000` | Silence heartbeat: if the turn is still running and nothing has been announced for this long, report progress once (0 = off). **There must be real activity during the window**; nothing is announced when it is genuinely stuck |
+| `silenceHeartbeatMs` | `30000` | Silence heartbeat: if the turn is still running and nothing has been announced for this long, report progress once (0 = off). **There must be real activity during the window** — a tool call in flight, or a model call in flight (see "Long generations" below). Nothing is announced when it is genuinely stuck |
+| `modelWaitMinGapMs` | `60000` | **Internal, not shown in the settings page** (deliberately not `volatile()`). Minimum interval for repeated "still waiting on the model" heartbeats — that wording only differs by the elapsed seconds, so 30s would be chatty. Tool-in-flight and buffered-content heartbeats are **not** affected. `0` disables the floor |
 | `announceTodoCompleted` | `true` | A todo item transitions to completed |
 | `announceApprovals` | `true` | Waiting for your approval (high priority, interrupts) |
 | `announceGoalChange` | `false` | Goal change |
@@ -140,6 +141,32 @@ gets cut — so a trailing closer would randomly disappear exactly when the summ
 **Consequence**: even when the summary fails or is empty, the closer is still spoken. That path previously
 logged `dropped` and stayed silent, which is the one place a missing end signal is least acceptable.
 
+### Long generations (silence while the model is writing)
+
+A single long model call emits **no session events at all** — no `assistant/message` (it has not finished),
+no `tool/call`. The official event docs settle what that means:
+
+> `step/start` — Opens step `step` of turn `turn` — **one model call plus the tool executions it requested.**
+
+So between `step/start` and `assistant/message` the host is provably inside a model call. The plugin tracks
+that as a first-class state (`waitingKind`), exactly like an in-flight tool call, and announces a
+**deterministic** line — the model is never asked to write it:
+
+* `还在等模型返回，已经 2 分 10 秒。`
+* `正在压缩上下文，已经 1 分 30 秒。` (context compaction)
+* `仍在执行 bash（sleep 180; echo waited），已等待 2 分 58 秒。` (tool in flight)
+
+**Honesty guardrail.** These lines state only what is verifiable — that a call is open and how long it has
+been open. They never say "almost done" or "not stuck": with the request already sent, neither is knowable.
+The heartbeat persona was corrected for the same reason (it used to instruct the model to reassure the
+listener that nothing was stuck, which invited fabrication).
+
+**Measured, not guessed.** Replaying 33 real sessions / 393 silence gaps longer than 60s: 44 gaps
+(5,258s; median 92s, max 323s) were this state, and after v1.4.0 they are all covered — worst-case silence
+in those windows drops from 323s to 60s, at a cost of 83 extra announcements across all 33 sessions.
+The "no state at all" case measured **0 gaps in 0 seconds**, which is why there is deliberately **no**
+time-based "everything is fine" fallback: it would add fabrication risk for zero measured benefit.
+
 ### The seven kinds of log lines
 
 Each `logFile` line is `timestamp <TAB> category <TAB> detail`:
@@ -148,7 +175,7 @@ Each `logFile` line is `timestamp <TAB> category <TAB> detail`:
 |:--|:--|
 | `ready` | Plugin mounted successfully (one line at startup). **This line missing = the plugin was never loaded** |
 | `boundary` | A stage boundary was detected |
-| `announce` | The announcement was handed to the speech queue — **note: this only means "it entered the queue", not "it played"**. Detail is `reason <TAB> text <TAB> source`, where `source` is `llm` / `rule` / `closer-only` — so you never have to guess whether a model wrote it |
+| `announce` | The announcement was handed to the speech queue — **note: this only means "it entered the queue", not "it played"**. Detail is `reason <TAB> text <TAB> source`, where `source` is `llm` / `rule` / `closer-only` / `fact` — so you never have to guess whether a model wrote it (`fact` = a deterministic status line spoken without calling the model) |
 | `coalesced` | The boundary was coalesced into an already-pending boundary (within the same-priority window) |
 | `dropped` | The summary was empty, or the plugin was unloaded/reloaded |
 | `pipeline-error` | The announcement pipeline threw, with the error message |
@@ -236,7 +263,7 @@ report, and remains a known silent window.
 
 ```bash
 pnpm install          # install devDependencies (real @deepseek-ai/* packages)
-npm test              # 76 offline unit tests, no DSH required
+npm test              # 83 offline unit tests, no DSH required
 npm run check-secrets # must run before committing: secrets and privacy guard
 npm run replay -- <session log> --verbose   # replay a real session
 ```
