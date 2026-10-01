@@ -105,6 +105,7 @@ There are two entry points for changes, and both write the same configuration: t
 | `llmTimeoutMs` | `15000` | Summary timeout; on timeout it falls back to the rule summary |
 | **Voice** | | |
 | `voice` | `''` | Empty follows the system default speech voice; a name pins it |
+| `voiceAlt` | `''` | **Alternate voice** (scheme A: the voice is bound to the *session*, not the turn). Empty = feature off. With several sessions running, the **first active session keeps the primary voice** and every **new** session gets this one — so you can tell which session is talking. When the primary session goes away, the next new session takes the primary voice back (single-session users never hear a drift). ⚠️ Must be a **MiniMax `voice_id`** (e.g. `Chinese (Mandarin)_Radio_Host`), not a macOS `say` voice name; it is passed as `MMX_VOICE`, which the bundled wrapper ranks above its config files. The primary path is untouched — it still reads `~/.dsh/tools/minimax-voice.txt` |
 | `rate` | `0` | macOS: words per minute (about 175 by default); Windows: SAPI `-10..10` |
 | `volume` | `100` | Windows only |
 | `engine` | `''` | Empty = macOS `say` / Windows `powershell`; `./x` resolves relative to the **package root**; anything else resolves via PATH |
@@ -263,7 +264,7 @@ report, and remains a known silent window.
 
 ```bash
 pnpm install          # install devDependencies (real @deepseek-ai/* packages)
-npm test              # 89 offline unit tests, no DSH required
+npm test              # 93 offline unit tests, no DSH required
 npm run check-secrets # must run before committing: secrets and privacy guard
 npm run replay -- <session log> --verbose   # replay a real session
 ```

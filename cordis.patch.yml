@@ -61,6 +61,10 @@
         # —— 声音 ——
         # 留空 = 跟随系统默认朗读音色（macOS 可用：Tingting / Meijia / Eddy / Flo …）
         voice: ''
+        # 备用音色（方案 A：音色绑定会话）。留空 = 关闭。
+        # 多会话并行时，第一个活跃会话用主音色、新开的会话用这个音色，便于分辨是哪一边在播。
+        # ⚠️ 要填 MiniMax 的 voice_id（如 Chinese (Mandarin)_Radio_Host），不能填 macOS say 的音色名。
+        voiceAlt: ''
         # macOS 是每分钟词数（默认约 175）；Windows 是 SAPI 的 -10..10
         rate: 0
         volume: 100

@@ -1212,6 +1212,80 @@ await test('等模型续报下限（方案丁）：下限内不重复，越过�
   ctx.disposeAll();
 });
 
+// ── v1.5.0：多会话音色（方案 A，音色绑定会话）──────────────────────────
+// 用户反馈：多会话并行时两边都播报，同一个音色分不清是哪一边。
+
+await test('音色覆盖：不传覆盖时一切照旧（零回归）', () => {
+  const { argv, env } = buildSpeechArgv('darwin', '/usr/bin/say', '你好', { voice: 'Lilian', rate: 0, volume: 100 });
+  assert.deepEqual(argv, ['/usr/bin/say', '-v', 'Lilian', '你好']);
+  assert.equal(env, undefined, '没有覆盖就不该下发 MMX_VOICE —— 主音色仍走外面的 voice 文件');
+});
+
+await test('音色覆盖：给了覆盖值就用它，并同时下发 MMX_VOICE（wrapper 只认这个）', () => {
+  const voice = 'Chinese (Mandarin)_Radio_Host';
+  const { argv, env } = buildSpeechArgv('darwin', '/usr/bin/say', '你好', { voice: 'Lilian', rate: 0, volume: 100 }, voice);
+  assert.deepEqual(argv, ['/usr/bin/say', '-v', voice, '你好'], 'argv 用覆盖音色');
+  assert.equal(env.MMX_VOICE, voice, '包内 wrapper 取最后一个 argv 当文本、忽略 -v，只能靠 MMX_VOICE');
+});
+
+await test('多会话音色（方案A）：第一个会话主音色，新开的会话拿备用音色', async () => {
+  const ALT = 'Chinese (Mandarin)_Radio_Host';
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '在跑。' }) });
+  apply(ctx, {
+    throttleMs: 0, minGapMs: 0, silenceHeartbeatMs: 0, announceKickoff: false,
+    voice: 'Lilian', voiceAlt: ALT, turnEndMinToolCalls: 1,
+  });
+  const announce = (session, id) => {
+    ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+    ctx.emit('session/event', session, {
+      type: 'todo/write',
+      data: { todos: [{ content: 'x', status: 'completed' }] },
+    });
+  };
+  const s1 = fakeSession('session-A');
+  announce(s1, 'a');
+  await tick(80);
+  const s2 = fakeSession('session-B');
+  announce(s2, 'b');
+  await tick(80);
+
+  const specs = subprocess.calls;
+  assert.equal(specs.length, 2, `两个会话各应播一次：${specs.length}`);
+  assert.ok(!(specs[0].env ?? {}).MMX_VOICE, '第一个会话是主音色，不该覆盖');
+  assert.ok(specs[0].argv.includes('Lilian'), '第一个会话用配置里的主音色');
+  assert.equal((specs[1].env ?? {}).MMX_VOICE, ALT, '第二个会话应换成备用音色');
+  assert.ok(specs[1].argv.includes(ALT), 'argv 也应是备用音色');
+
+  // 主音色会话退场后，下一个新会话应重新拿回主音色（否则单会话用户会听到声音漂移）
+  ctx.emit('session/disposed', s1);
+  const s3 = fakeSession('session-C');
+  announce(s3, 'c');
+  await tick(80);
+  const last = subprocess.calls.at(-1);
+  assert.ok(!(last.env ?? {}).MMX_VOICE, '主音色空出来后，新会话要拿回主音色');
+  ctx.disposeAll();
+});
+
+await test('多会话音色：voiceAlt 留空即功能关闭（默认行为不变）', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '在跑。' }) });
+  apply(ctx, { throttleMs: 0, minGapMs: 0, silenceHeartbeatMs: 0, announceKickoff: false, voice: 'Lilian' });
+  for (const id of ['session-A', 'session-B']) {
+    const session = fakeSession(id);
+    ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+    ctx.emit('session/event', session, { type: 'todo/write', data: { todos: [{ content: 'x', status: 'completed' }] } });
+    await tick(80);
+  }
+  const specs = subprocess.calls;
+  assert.equal(specs.length, 2, '两个会话各播一次');
+  for (const spec of specs) {
+    assert.ok(!(spec.env ?? {}).MMX_VOICE, 'voiceAlt 留空时任何会话都不该被覆盖');
+    assert.ok(spec.argv.includes('Lilian'));
+  }
+  ctx.disposeAll();
+});
+
 // ── v1.4.2：状态短语（不念原始参数）+ 断点信号（审批 / 提问）──────────────
 // 用户反馈 1：「你相当于是直接把原始指令读了出来，中文又夹杂着，感觉很奇怪。」
 // 用户反馈 2：「我没有明确听到说这是一个需要我去审批或确认的断点。」

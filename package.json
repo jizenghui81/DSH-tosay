@@ -1,6 +1,6 @@
 {
   "name": "dsh-stage-speak",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "description": "DSH 阶段摘要语音播报：在每个阶段边界用模型把进展压成一句人话，再经语音引擎念出来",
   "license": "MIT",
   "type": "module",
