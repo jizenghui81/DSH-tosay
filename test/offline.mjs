@@ -865,6 +865,33 @@ await test('composeAnnouncement：收束语在前；摘要为空时收束语仍�
   assert.equal(composeAnnouncement(undefined, undefined), '');
 });
 
+// ── 回归：规则兜底不许断言"没卡住"（v1.5.1）───────────────────────────
+// 人设早在 v1.4.0 就禁了这类无法证实的断言，但**规则兜底文案漏改**（用户 2026-10-01 指出）。
+
+await test('规则兜底：任何边界的文案都不许断言"没卡住 / 一切正常 / 快好了"', () => {
+  const snapshots = [
+    { lines: [], toolCalls: 0, turnToolCalls: 0 },
+    { lines: ['工具 bash'], toolCalls: 5, turnToolCalls: 5 },
+    { lines: ['工具报错（E_TOOL）'], toolCalls: 1, turnToolCalls: 1 },
+    { lines: ['待办 3/5 完成'], toolCalls: 2, turnToolCalls: 2 },
+  ];
+  const reasons = ['progress-heartbeat', 'turn-end', 'tool-milestone', 'tool-error',
+                   'approval', 'user-question', 'kickoff', 'goal-change'];
+  for (const snap of snapshots) {
+    for (const reason of reasons) {
+      const text = ruleSummary(snap, reason);
+      for (const banned of ['没有卡住', '没卡住', '一切正常', '快好了']) {
+        assert.ok(
+          !text.includes(banned),
+          `${reason} 的规则兜底出现了无法证实的断言「${banned}」：${text}`,
+        );
+      }
+    }
+  }
+  // 正面断言：心跳兜底要给出可核对的事实（走了几步）
+  assert.ok(ruleSummary({ lines: [], toolCalls: 7, turnToolCalls: 7 }, 'progress-heartbeat').includes('7'));
+});
+
 // ── 回归：收束语被连说两遍（2026-10-01 06:53 用户实听）───────────────────
 // 现场：06:52:49 一次心跳播报 drain() 把 toolCallsSinceAnnounce 清零 →
 // 06:53:06 turn-end 时快照里 toolCalls=0 → 规则兜底吐出「这一轮结束了。」，
@@ -1008,7 +1035,7 @@ await test('静默心跳：本轮进行中 + 有活动 + 超时 → 报一次进
 
 await test('心跳健壮性：插件在某轮中途才挂载（没看到 turn/start）也能触发', async () => {
   const subprocess = fakeSubprocess();
-  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '还在跑，没有卡住。' }) });
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '还在跑，本阶段走了几步。' }) });
   apply(ctx, HCFG);
   const session = fakeSession();
   // 刻意不发 turn/start —— 模拟插件在这一轮进行到一半时才加载
@@ -1036,7 +1063,7 @@ await test('静默心跳守卫：没有活动不报（防"卡住了还硬说在�
 
 await test('回归 187s 静默：长工具调用飞行期内，缓冲被 drain 抽干后仍必须报', async () => {
   const subprocess = fakeSubprocess();
-  const llm = fakeLlm({ text: '还在等，没有卡住。' });
+  const llm = fakeLlm({ text: '还在等这一步跑完。' });
   const ctx = fakeCtx({ subprocess, llm });
   apply(ctx, HCFG);
   const session = fakeSession();
