@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+
+# 🔒 密钥与私人配置 —— 绝不入库
+.env
+.env.*
+*.pem
+*.key
+.mmx/
+minimax-redact.txt
+*.local.json
+*.secret.*
+
+# 运行时产物
+*.log
+.cache/
+
+# macOS
+.DS_Store

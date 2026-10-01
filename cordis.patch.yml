@@ -1,0 +1,75 @@
+# dsh-stage-speak bundle patch：挂载插件行。
+#
+# 这里放"开箱即用"的默认值。要改行为有两个入口，二者写的是同一份配置：
+#   1) DSH 的设置页（本包导出了 Config，带 volatile() 的字段会出现在那里）
+#   2) 直接改下面这个 config 块
+#
+# ⚠️ 关于层与覆盖（官方《打包与安装插件》"加载顺序"）：
+#   生效配置按 bundle patch → profile cordis.patch.yml → $DSH_HOME/cordis.patch.yml
+#   → --patch overlay 的顺序叠加，**后应用的层按行取胜，且 patch 会替换目标行的整个
+#   config，而不是深度合并各键**。所以：
+#     · 用户若在自己的 profile 里写同 id 的顶层行，该行的 config 会整体替换本行 ——
+#       想保留这里的某项默认值，就必须在自己的行里重述它。
+#     · 这也正是"长期用设置页调参时，把 config 拆成独立顶层行"的原因。
+#
+# 🔒 本文件不含任何密钥。云端引擎的 Key 从 MINIMAX_API_KEY 环境变量或
+#    ~/.mmx/config.json 读取，两者都在仓库之外。
+- insert:
+    - id: dsh-stage-speak
+      name: dsh-stage-speak
+      config:
+        # 总开关
+        enabled: true
+        # —— 播报什么 ——
+        announceTurnEnd: true
+        # 开工反馈：接到新任务第一时间回一句"收到 + 打算怎么做"
+        announceKickoff: true
+        # 专用短节流窗口 —— "第一时间"不能被默认 2500ms 拖累
+        kickoffThrottleMs: 400
+        # 任务短于此字数不念（如"继续"）
+        kickoffMinTaskChars: 4
+        # 静默心跳：本轮进行中且这么久没播报就报一次进展（0 = 关闭）
+        # ⚠️ 期间必须确实有活动才报 —— 真卡住时不报，绝不编造"正在努力工作"
+        silenceHeartbeatMs: 30000
+        announceTodoCompleted: true
+        announceApprovals: true
+        announceGoalChange: false
+        # 子代理会话默认不播报，否则并行跑多个子代理会变成菜市场
+        includeSubagents: false
+        # 按错误码过滤"按设计可自愈"的工具报错（真实会话回放校准所得）
+        toolErrorIgnoreCodes:
+          - FS_NOT_OBSERVED
+          - FS_STALE_VERSION
+        toolErrorPriority: normal
+        # —— 节奏 ——
+        throttleMs: 2500
+        minGapMs: 6000
+        stageToolCalls: 8
+        turnEndMinToolCalls: 1
+        # —— 摘要 ——
+        useLlmSummary: true
+        maxChars: 120
+        # 留空 = 用该会话自己的模型路由；也可显式指定便宜的模型
+        summaryProvider: ''
+        summaryModel: ''
+        # —— 声音 ——
+        # 留空 = 跟随系统默认朗读音色（macOS 可用：Tingting / Meijia / Eddy / Flo …）
+        voice: ''
+        # macOS 是每分钟词数（默认约 175）；Windows 是 SAPI 的 -10..10
+        rate: 0
+        volume: 100
+        # 留空 = macOS 用 say / Windows 用 powershell —— 零配置、纯本地、不需要密钥。
+        #
+        # 想改用云端引擎（MiniMax T2A，音质更好，比 HD 便宜 43%）：
+        #   1) 把本行改成相对路径（相对**包根**解析，因此跨机器可移植）：
+        #        engine: ./engine/minimax-speak.sh
+        #   2) 提供密钥：环境变量 MINIMAX_API_KEY，或 ~/.mmx/config.json 的 api_key
+        #   3) 换模型/音色不用改脚本：
+        #        ~/.dsh/tools/minimax-model.txt   （如 speech-2.8-turbo）
+        #        ~/.dsh/tools/minimax-voice.txt   （如 Chinese (Mandarin)_Warm_Girl）
+        engine: ''
+        # —— 运维 ——
+        # 播报审计日志。`~` 会被插件展开，因此这个默认值跨机器可用。
+        # 看不到 ready 行 = 插件根本没加载；这是排查链的第一环。
+        logFile: ~/.dsh/dsh-stage-speak.log
+        logAnnouncements: false

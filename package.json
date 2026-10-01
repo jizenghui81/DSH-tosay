@@ -1,0 +1,81 @@
+{
+  "name": "dsh-stage-speak",
+  "version": "1.2.0",
+  "description": "DSH 阶段摘要语音播报：在每个阶段边界用模型把进展压成一句人话，再经语音引擎念出来",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jizenghui81/DSH-tosay.git"
+  },
+  "homepage": "https://github.com/jizenghui81/DSH-tosay#readme",
+  "bugs": {
+    "url": "https://github.com/jizenghui81/DSH-tosay/issues"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./engine/*": "./engine/*",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "//dsh": "profile bundle 声明：声明了 dsh.bundle 的依赖会被 launcher 自动挂载，装完即生效。engines.dsh 让旧宿主拿到明确信号而不是静默失效。",
+  "dsh": {
+    "manifestVersion": 1,
+    "engines": {
+      "dsh": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "//peerDependencies": "按官方《打包与安装插件》的要求，需要与宿主共享实例的 dsh 包要同时声明在 peerDependencies 与 devDependencies：peer 给出兼容性信号，dev 供类型检查与独立测试。实测（2026-10-01，pnpm 10.33.2）：在 profile 的 pnpm-workspace.yaml 设 autoInstallPeers: false 的前提下，声明 peer 只产生一条 WARN 列出期望的宿主包，不会联网拉取、不会导致安装失败。",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.2 <5",
+    "@deepseek-ai/schemastery": ">=3.18 <4",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.2 <5",
+    "@deepseek-ai/schemastery": ">=3.18 <4",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.1.7-rc.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0"
+  },
+  "//no-local-node_modules": "严禁把测试替身放进 node_modules/。历史事故：node_modules/@deepseek-ai/schemastery 放了一个没有 Standard Schema ~standard 接口的桩件，link: 安装时 Node 解析到包真实路径、桩件抢先命中顶掉宿主真库，Cordis 报 Cannot read properties of undefined (reading 'validate')。现在改为在 devDependencies 里装真包，桩件已删除。",
+  "files": [
+    "lib",
+    "engine",
+    "scripts",
+    "cordis.patch.yml",
+    "dsh-plugin.naming.json",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/offline.mjs",
+    "replay": "node test/replay-session.mjs",
+    "check-secrets": "node scripts/check-secrets.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "tts",
+    "voice",
+    "speech",
+    "announcement",
+    "minimax"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24"
+  }
+}
