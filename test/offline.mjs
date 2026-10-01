@@ -10,10 +10,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cleanForSpeech, truncateForSpeech } from '../lib/clean.js';
-import { PRIORITY, createSessionState, drain, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage } from '../lib/activity.js';
+import { PRIORITY, closerFor, createSessionState, drain, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage } from '../lib/activity.js';
 import { ruleSummary, buildPrompt } from '../lib/summarize.js';
 import { buildSpawnSpec, buildSpeechArgv, createSpeechEngine, resolveEnginePath } from '../lib/engine.js';
-import { expandHome, readField, resolveConfig } from '../lib/index.js';
+import { composeAnnouncement, expandHome, readField, resolveConfig } from '../lib/index.js';
 
 let passed = 0;
 let failed = 0;
@@ -758,9 +758,10 @@ await test('中途播报清零计数后，turn-end 仍必须播（该轮干过�
   ctx.disposeAll();
 });
 
-await test('纯聊天的一轮（零工具调用）仍然不播 turn-end', async () => {
+await test('零工具调用的聊天轮次：不念摘要，但结束信号必须给（只播收束语）', async () => {
   const subprocess = fakeSubprocess();
-  const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
+  const llm = fakeLlm();
+  const ctx = fakeCtx({ subprocess, llm });
   apply(ctx, TECFG);
   const session = fakeSession();
   ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
@@ -770,8 +771,98 @@ await test('纯聊天的一轮（零工具调用）仍然不播 turn-end', async
   });
   ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   await tick(250);
-  assert.equal(subprocess.calls.length, 0, '没干活的轮次不该播收尾');
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1));
+  assert.deepEqual(spoken, ['这一轮结束了。'], `聊天轮次只播收束语，实际：${JSON.stringify(spoken)}`);
+  assert.equal(llm.seen.length, 0, '没有可汇报的操作，就不该为此调一次模型');
   ctx.disposeAll();
+});
+
+await test('announceTurnEndOnChat=false 时，聊天轮次回归静默（旧行为可恢复）', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
+  apply(ctx, { ...TECFG, announceTurnEndOnChat: false });
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, {
+    type: 'assistant/message',
+    data: { message: { role: 'assistant', content: [{ type: 'text', text: '好的，我明白了。' }] } },
+  });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(250);
+  assert.equal(subprocess.calls.length, 0, '关掉开关后应完全静默');
+  ctx.disposeAll();
+});
+
+// ── turn-end 收束语：确定性的"这一轮结束了" ──────────────────────
+// 2026-10-01 用户反馈：「任务全部完成之后，我可能听不出来这是一个明确的会话结束信号。」
+// 审计证据：30 条 turn-end 播报里只有 4 条带收尾措辞、且措辞各不相同（这轮任务完成 / 这轮结束了 /
+// 这一轮做完了），而同期 156 条**中途**进展播报里也有 10 条含同类词汇 —— 两边词汇重叠，
+// 耳朵没有任何可依赖的判别特征。修法：收束语由代码写死（closerFor），在摘要之外拼到**句首**。
+
+await test('收束语：三种结束原因各有确定文案，未知原因回退到"正常结束"', () => {
+  assert.equal(closerFor('completed'), '这一轮结束了。');
+  assert.equal(closerFor('error'), '这一轮报错中断了。');
+  assert.equal(closerFor('aborted'), '这一轮被中断了。');
+  assert.equal(closerFor('max-steps'), '这一轮结束了。', '未知 kind 不该让播报变成 undefined');
+  assert.equal(closerFor(undefined), '这一轮结束了。');
+});
+
+await test('收束语：turn-end 以收束语开头，并区分完成 / 报错 / 中断', async () => {
+  for (const [kind, closer] of [['completed', '这一轮结束了。'], ['error', '这一轮报错中断了。'], ['aborted', '这一轮被中断了。']]) {
+    const subprocess = fakeSubprocess();
+    const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '修好了两处配置。' }) });
+    apply(ctx, TECFG);
+    const session = fakeSession();
+    ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+    ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+    ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind } } });
+    await tick(250);
+    const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+    assert.ok(spoken.startsWith(closer), `${kind} 应以「${closer}」开头，实际：${spoken}`);
+    assert.ok(spoken.includes('修好了两处配置'), `${kind} 的摘要应保留在后面：${spoken}`);
+    ctx.disposeAll();
+  }
+});
+
+await test('收束语：只有 turn-end 带，中途里程碑不带（否则信号又失去区分度）', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '正在改配置。' }) });
+  apply(ctx, TECFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'a', name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'b', name: 'bash' } });
+  await tick(250);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+  assert.ok(spoken.includes('正在改配置'), `中途里程碑应播摘要：${spoken}`);
+  assert.ok(!spoken.includes('这一轮结束了'), `中途播报不许带收束语：${spoken}`);
+  ctx.disposeAll();
+});
+
+await test('收束语结构性安全：摘要被 maxChars 截断后，句首收束语仍完整', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '第一句很长很长。第二句也很长。第三句收尾。' }) });
+  apply(ctx, { ...TECFG, maxChars: 12 });
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(250);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
+  assert.ok(spoken.startsWith('这一轮结束了。'), `收束语必须在最前且完整：${spoken}`);
+  assert.ok(
+    spoken.length <= '这一轮结束了。'.length + 12,
+    `摘要应受 maxChars 限制，收束语不该把总量撑破：${spoken.length}`,
+  );
+  ctx.disposeAll();
+});
+
+await test('composeAnnouncement：收束语在前；摘要为空时收束语仍然出声', () => {
+  assert.equal(composeAnnouncement('这一轮结束了。', '做了三件事。'), '这一轮结束了。做了三件事。');
+  assert.equal(composeAnnouncement('这一轮结束了。', ''), '这一轮结束了。', '摘要失败不能吞掉结束信号');
+  assert.equal(composeAnnouncement('', '做了三件事。'), '做了三件事。', '非 turn-end 边界不带收束语');
+  assert.equal(composeAnnouncement('', ''), '', '两边都空才允许 dropped');
+  assert.equal(composeAnnouncement(undefined, undefined), '');
 });
 
 // ── 通道契约：判定了就必须留下留痕 ────────────────────────

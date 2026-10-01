@@ -22,6 +22,9 @@
         enabled: true
         # —— 播报什么 ——
         announceTurnEnd: true
+        # 零工具调用的纯聊天轮次：不念摘要，但仍播一句收束语
+        # ⚠️ 收束语（"这一轮结束了。"）由代码写死、不经过模型，是**确定性的结束信号**
+        announceTurnEndOnChat: true
         # 开工反馈：接到新任务第一时间回一句"收到 + 打算怎么做"
         announceKickoff: true
         # 专用短节流窗口 —— "第一时间"不能被默认 2500ms 拖累
