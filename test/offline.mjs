@@ -865,6 +865,85 @@ await test('composeAnnouncement：收束语在前；摘要为空时收束语仍�
   assert.equal(composeAnnouncement(undefined, undefined), '');
 });
 
+// ── 回归：收束语被连说两遍（2026-10-01 06:53 用户实听）───────────────────
+// 现场：06:52:49 一次心跳播报 drain() 把 toolCallsSinceAnnounce 清零 →
+// 06:53:06 turn-end 时快照里 toolCalls=0 → 规则兜底吐出「这一轮结束了。」，
+// 而它恰好等于 v1.3.0 的确定性收束语 → 拼成「这一轮结束了。这一轮结束了。」。
+
+await test('composeAnnouncement：摘要自带收束语时不得重复拼接', () => {
+  assert.equal(composeAnnouncement('这一轮结束了。', '这一轮结束了。'), '这一轮结束了。');
+  assert.equal(
+    composeAnnouncement('这一轮结束了。', '这一轮结束了。我改了三个文件。'),
+    '这一轮结束了。我改了三个文件。',
+    '模型自己写了收束语时同理',
+  );
+  assert.equal(composeAnnouncement('这一轮结束了。', '我改了三个文件。'), '这一轮结束了。我改了三个文件。');
+});
+
+await test('规则兜底：turn-end 必须用轮次级计数，零步时不再吐出收束语本身', () => {
+  assert.ok(
+    ruleSummary({ lines: [], toolCalls: 0, turnToolCalls: 12 }, 'turn-end').includes('12'),
+    '心跳清零快照后，仍必须报出整轮的真实步数',
+  );
+  assert.equal(
+    ruleSummary({ lines: [], toolCalls: 0, turnToolCalls: 0 }, 'turn-end'),
+    '这一轮没有具体操作。',
+    '零步文案不得等于收束语，否则又会拼出重复',
+  );
+  assert.ok(ruleSummary({ lines: [], toolCalls: 5 }, 'turn-end').includes('5'), '旧快照（无 turnToolCalls）要向后兼容');
+});
+
+await test('回归（端到端）：心跳抽干计数后，收尾播报里收束语只许出现一次', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ fail: true }) }); // 强制走规则兜底
+  apply(ctx, {
+    throttleMs: 0, minGapMs: 0, announceKickoff: false, silenceHeartbeatMs: 200,
+    announceTurnEnd: true, turnEndMinToolCalls: 1, stageToolCalls: 999,
+  });
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+  await tick(600); // ← 心跳播报发生，drain() 清零计数（复刻 06:52:49）
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(400);
+  const last = subprocess.calls.map((c) => c.argv.at(-1)).at(-1) ?? '';
+  assert.ok(last.startsWith('这一轮结束了。'), `收尾仍要以收束语开头：${last}`);
+  assert.equal(last.split('这一轮结束了').length - 1, 1, `收束语只许出现一次，实际：${last}`);
+  assert.ok(last.includes('1 步操作'), `步数应取自轮次级计数：${last}`);
+  ctx.disposeAll();
+});
+
+await test('审计留痕：announce 行第 4 字段标出摘要来源（llm / rule / closer-only）', async () => {
+  const cases = [
+    { name: 'llm', llm: fakeLlm({ text: '改了三个文件。' }), events: 'worked', want: 'llm' },
+    { name: 'rule', llm: fakeLlm({ fail: true }), events: 'worked', want: 'rule' },
+    { name: 'closer-only', llm: fakeLlm(), events: 'chat', want: 'closer-only' },
+  ];
+  for (const item of cases) {
+    const logFile = path.join(os.tmpdir(), `dspeak-src-${item.name}-${process.pid}-${Date.now()}.log`);
+    try {
+      const subprocess = fakeSubprocess();
+      const ctx = fakeCtx({ subprocess, llm: item.llm });
+      apply(ctx, { throttleMs: 0, minGapMs: 0, announceKickoff: false, silenceHeartbeatMs: 0, logFile });
+      const session = fakeSession();
+      ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+      if (item.events === 'worked') {
+        ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+      }
+      ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+      await tick(300);
+      const announces = fs.readFileSync(logFile, 'utf8').trim().split('\n')
+        .map((line) => line.split('\t'))
+        .filter((parts) => parts[1] === 'announce' && parts[2] === 'turn-end');
+      assert.equal(announces.length, 1, `${item.name}：应有一条 turn-end 播报`);
+      assert.equal(announces[0][4], item.want, `${item.name}：来源字段错误（${announces[0].join(' | ')}）`);
+      ctx.disposeAll();
+    } finally {
+      try { fs.unlinkSync(logFile); } catch { /* 忽略 */ }
+    }
+  }
+});
+
 // ── 通道契约：判定了就必须留下留痕 ────────────────────────
 // 2026-10-01 排查「判定了却没播」时，4 条边界无法归因 —— 因为「合并」和「流水线失败」
 // 都不写审计日志。现在约定：每个 boundary 最终必有 announce / dropped / coalesced / pipeline-error 之一。
