@@ -1211,6 +1211,37 @@ await test('等模型续报下限（方案丁）：下限内不重复，越过�
   ctx.disposeAll();
 });
 
+await test('事实型播报的守卫：事实自己也要"够有料"，不许念「已经 4 秒」', async () => {
+  // 线上实测（2026-10-01 07:15，重启后的首次验证）：久静默之后紧接着一次新的模型调用，
+  // 心跳因"距上次播报已超阈值"而触发，话术却念出「还在等模型返回，已经 4 秒」。
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '在跑。' }) });
+  apply(ctx, HCFG); // silenceHeartbeatMs 300 / tick 200
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+  await tick(500); // 第一次心跳（缓冲有内容 → 走摘要）
+  const afterFirst = subprocess.calls.length;
+  assert.ok(afterFirst >= 1, '第一次心跳应播');
+  ctx.emit('session/event', session, { type: 'tool/result', data: { toolCallId: 'c1' } });
+  await tick(400); // 此后无任何活动 → 三态皆空，正确沉默
+  assert.equal(subprocess.calls.length, afterFirst, '无活动期间不该播');
+  // 静默已久，此刻开一次新的模型调用：这条事实只有 ~200ms 大 → 不许开口
+  ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 2 } });
+  await tick(200);
+  assert.equal(subprocess.calls.length, afterFirst, '刚开的模型调用不值得播报');
+  // 等这条事实自己长过阈值 → 才出声（此时才轮到它）
+  await tick(600);
+  assert.equal(
+    subprocess.calls.length,
+    afterFirst + 1,
+    '事实够久后应恰好出声一次（说明前面压住它的是"事实太新"，不是别的）',
+  );
+  const last = subprocess.calls.map((c) => c.argv.at(-1)).at(-1) ?? '';
+  assert.ok(last.includes('还在等模型返回'), `应念等待态话术：${last}`);
+  ctx.disposeAll();
+});
+
 await test('事实型播报的守卫：期间若来了新事件，改走摘要而不念那句可能已过时的话', async () => {
   const subprocess = fakeSubprocess();
   const llm = fakeLlm({ text: '刚生成完一段回复。' });

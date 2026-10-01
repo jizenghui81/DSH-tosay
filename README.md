@@ -263,7 +263,7 @@ report, and remains a known silent window.
 
 ```bash
 pnpm install          # install devDependencies (real @deepseek-ai/* packages)
-npm test              # 83 offline unit tests, no DSH required
+npm test              # 84 offline unit tests, no DSH required
 npm run check-secrets # must run before committing: secrets and privacy guard
 npm run replay -- <session log> --verbose   # replay a real session
 ```
