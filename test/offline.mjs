@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cleanForSpeech, truncateForSpeech } from '../lib/clean.js';
-import { PRIORITY, closerFor, createSessionState, drain, formatDuration, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage, waitingLine } from '../lib/activity.js';
+import { APPROVAL_SIGNAL, ASK_USER_SIGNAL, PRIORITY, cleanApprovalReason, closerFor, createSessionState, describeTool, drain, formatDuration, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage, waitingLine } from '../lib/activity.js';
 import { ruleSummary, buildPrompt } from '../lib/summarize.js';
 import { buildSpawnSpec, buildSpeechArgv, createSpeechEngine, resolveEnginePath } from '../lib/engine.js';
 import { composeAnnouncement, expandHome, readField, resolveConfig } from '../lib/index.js';
@@ -913,11 +913,11 @@ await test('回归（端到端）：心跳抽干计数后，收尾播报里收�
   ctx.disposeAll();
 });
 
-await test('审计留痕：announce 行第 4 字段标出来源（llm / rule / closer-only / fact）', async () => {
+await test('审计留痕：announce 行第 4 字段标出来源（llm / rule / signal-only / fact）', async () => {
   const cases = [
     { name: 'llm', llm: fakeLlm({ text: '改了三个文件。' }), events: 'worked', reason: 'turn-end', want: 'llm' },
     { name: 'rule', llm: fakeLlm({ fail: true }), events: 'worked', reason: 'turn-end', want: 'rule' },
-    { name: 'closer-only', llm: fakeLlm(), events: 'chat', reason: 'turn-end', want: 'closer-only' },
+    { name: 'signal-only', llm: fakeLlm(), events: 'chat', reason: 'turn-end', want: 'signal-only' },
     // 事实型：等模型长生成期间的心跳，不调摘要模型
     { name: 'fact', llm: fakeLlm(), events: 'waiting', reason: 'progress-heartbeat', want: 'fact' },
   ];
@@ -1058,8 +1058,9 @@ await test('回归 187s 静默：长工具调用飞行期内，缓冲被 drain �
   );
   // v1.4.0：事实型心跳**不走摘要模型**，直接念那条如实描述（零编造 + 零延迟）
   const spoken = subprocess.calls.map((c) => c.argv.at(-1)).join('');
-  assert.ok(spoken.includes('仍在执行'), `应说清还在跑什么：${spoken}`);
-  assert.ok(spoken.includes('sleep 180'), `应带上真正在跑的命令：${spoken}`);
+  assert.ok(spoken.includes('还在跑一条命令'), `应报状态短语：${spoken}`);
+  assert.ok(!spoken.includes('sleep 180'), `绝不能念原始命令：${spoken}`);
+  assert.ok(!spoken.includes('$('), `绝不能念原始参数：${spoken}`);
   assert.equal(llm.seen.length, llmCallsAfterFirst, '事实型心跳不该再调摘要模型');
   ctx.disposeAll();
 });
@@ -1117,11 +1118,11 @@ await test('在飞调用：描述如实带出"在跑什么 + 等了多久 + 并�
   const s = createSessionState('s');
   noteEvent(s, { type: 'tool/call', data: { callId: 'a', name: 'bash', arguments: JSON.stringify({ command: 'sleep 180; echo waited' }) } }, {});
   const line = pendingWorkLine(s, s.inFlightCalls[0].at + 178000);
-  assert.ok(line.includes('仍在执行'), `应说清还在跑：${line}`);
-  assert.ok(line.includes('sleep 180'), `应带上真正在跑的命令：${line}`);
-  assert.ok(line.includes('2 分 58 秒'), `等这么久要念成口语时长，不能报"178 秒"：${line}`);
+  assert.equal(line, '还在跑一条命令，已经 2 分 58 秒', '状态短语 + 口语时长，不含原始参数');
+  assert.ok(!line.includes('sleep 180'), `不得念原始命令：${line}`);
+  assert.ok(!line.includes('bash'), `不得念英文工具名：${line}`);
   noteEvent(s, { type: 'tool/call', data: { callId: 'b', name: 'web_fetch' } }, {});
-  assert.ok(pendingWorkLine(s, s.inFlightCalls[0].at).includes('另有 1 个调用同时在跑'), '并发时要说明还有别的在跑');
+  assert.ok(pendingWorkLine(s, s.inFlightCalls[0].at).includes('另有 1 个操作在跑'), '并发时要说明还有别的在跑');
   assert.equal(pendingWorkLine(createSessionState('empty')), '', '没有在飞调用时返回空串');
 });
 
@@ -1209,6 +1210,87 @@ await test('等模型续报下限（方案丁）：下限内不重复，越过�
   await tick(1000); // 越过下限
   assert.ok(subprocess.calls.length > first, '越过下限后必须续报，否则又变回沉默');
   ctx.disposeAll();
+});
+
+// ── v1.4.2：状态短语（不念原始参数）+ 断点信号（审批 / 提问）──────────────
+// 用户反馈 1：「你相当于是直接把原始指令读了出来，中文又夹杂着，感觉很奇怪。」
+// 用户反馈 2：「我没有明确听到说这是一个需要我去审批或确认的断点。」
+
+await test('状态短语：按真实频次分类，未收录的一律兜底，绝不出现英文工具名', () => {
+  assert.equal(describeTool('bash'), '还在跑一条命令');
+  assert.equal(describeTool('run_code'), '还在跑一段脚本');
+  assert.equal(describeTool('job_output'), '还在等后台任务');
+  assert.equal(describeTool('plugin_manager'), '还在装或查插件');
+  assert.equal(describeTool('write'), '还在写文件');
+  assert.equal(describeTool('web_fetch'), '还在读网页');
+  assert.equal(describeTool('brand_new_tool'), '还在跑一个操作', '新工具要兜底，不能把英文名念出去');
+  assert.equal(describeTool(undefined), '还在跑一个操作');
+});
+
+await test('状态短语：原始参数一个都不许进播报文本（拿真实那条命令当反例）', () => {
+  const s = createSessionState('s');
+  noteEvent(s, {
+    type: 'tool/call',
+    data: { callId: 'a', name: 'bash', arguments: JSON.stringify({ command: 'BEFORE=$(wc -l < ~/.dsh/dsh-stage-speak.log); echo "开始 UTC $(date -u +%H:%M:%S)"' }) },
+  }, {});
+  const line = pendingWorkLine(s, s.inFlightCalls[0].at + 62000);
+  assert.equal(line, '还在跑一条命令，已经 1 分 2 秒');
+  for (const banned of ['wc -l', 'BEFORE', '$(', '~/.dsh', 'bash', 'echo']) {
+    assert.ok(!line.includes(banned), `播报里出现了原始内容「${banned}」：${line}`);
+  }
+});
+
+await test('审批断点：确定性信号在前，且等待期不许再播"在干活"', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '要改本地 git 代理配置。' }) });
+  apply(ctx, HCFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  // 实测 17/17：审批发生时**总有**工具在飞 —— 正是旧逻辑把它报成"还在跑命令"的原因
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+  ctx.emit('session/event', session, {
+    type: 'approval/asked',
+    data: { toolName: 'bash', reason: 'escalate sandbox to danger-full-access: 必须给 git 配置代理，否则同步通道不可用。' },
+  });
+  await tick(600);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1));
+  assert.equal(spoken.length, 1, `审批只应播一次，实际：${JSON.stringify(spoken)}`);
+  assert.ok(spoken[0].startsWith(APPROVAL_SIGNAL), `必须明确说出这是断点：${spoken[0]}`);
+  // 等待审批期间：球在用户手上 → 不许再播
+  await tick(900);
+  assert.equal(subprocess.calls.length, 1, '审批等待期必须静默');
+  // 批了之后恢复心跳能力
+  ctx.emit('session/event', session, { type: 'approval/decided', data: {} });
+  await tick(900);
+  assert.ok(subprocess.calls.length > 1, '审批结束后应恢复播报能力');
+  ctx.disposeAll();
+});
+
+await test('提问断点：ask_user_question 也是断点（不是中间过程），等待期静默', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '问你要不要继续用旧目录。' }) });
+  apply(ctx, HCFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'q1', name: 'ask_user_question', arguments: '{"questions":[]}' } });
+  await tick(600);
+  const spoken = subprocess.calls.map((c) => c.argv.at(-1));
+  assert.equal(spoken.length, 1, `提问只应播一次，实际：${JSON.stringify(spoken)}`);
+  assert.ok(spoken[0].startsWith(ASK_USER_SIGNAL), `必须明确说出这是断点：${spoken[0]}`);
+  await tick(900);
+  assert.equal(subprocess.calls.length, 1, '等用户回答期间必须静默（实测中位 49 秒、最长 540 秒）');
+  ctx.disposeAll();
+});
+
+await test('审批文本清洗：剥掉纯英文机器前缀，只留中文说明', () => {
+  assert.equal(
+    cleanApprovalReason('escalate sandbox to danger-full-access: Air 本机直连 github.com 被阻断，必须配置代理。'),
+    'Air 本机直连 github.com 被阻断，必须配置代理。',
+  );
+  assert.equal(cleanApprovalReason('这已经是中文：不要剥掉'), '这已经是中文：不要剥掉', '含汉字的前缀不能当机器前缀');
+  assert.equal(cleanApprovalReason(''), '');
+  assert.equal(cleanApprovalReason(undefined), '');
+  assert.ok(cleanApprovalReason('x'.repeat(400)).length <= 161, '过长的原因要截断，免得播报变成长文');
 });
 
 await test('事实型播报的守卫：事实自己也要"够有料"，不许念「已经 4 秒」', async () => {

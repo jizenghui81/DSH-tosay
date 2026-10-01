@@ -175,7 +175,7 @@ Each `logFile` line is `timestamp <TAB> category <TAB> detail`:
 |:--|:--|
 | `ready` | Plugin mounted successfully (one line at startup). **This line missing = the plugin was never loaded** |
 | `boundary` | A stage boundary was detected |
-| `announce` | The announcement was handed to the speech queue — **note: this only means "it entered the queue", not "it played"**. Detail is `reason <TAB> text <TAB> source`, where `source` is `llm` / `rule` / `closer-only` / `fact` — so you never have to guess whether a model wrote it (`fact` = a deterministic status line spoken without calling the model) |
+| `announce` | The announcement was handed to the speech queue — **note: this only means "it entered the queue", not "it played"**. Detail is `reason <TAB> text <TAB> source`, where `source` is `llm` / `rule` / `signal-only` / `fact` — so you never have to guess whether a model wrote it (`fact` = a deterministic status line spoken without calling the model) |
 | `coalesced` | The boundary was coalesced into an already-pending boundary (within the same-priority window) |
 | `dropped` | The summary was empty, or the plugin was unloaded/reloaded |
 | `pipeline-error` | The announcement pipeline threw, with the error message |
@@ -263,7 +263,7 @@ report, and remains a known silent window.
 
 ```bash
 pnpm install          # install devDependencies (real @deepseek-ai/* packages)
-npm test              # 84 offline unit tests, no DSH required
+npm test              # 89 offline unit tests, no DSH required
 npm run check-secrets # must run before committing: secrets and privacy guard
 npm run replay -- <session log> --verbose   # replay a real session
 ```
