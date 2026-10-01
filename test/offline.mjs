@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cleanForSpeech, truncateForSpeech } from '../lib/clean.js';
-import { PRIORITY, createSessionState, drain, noteEvent, readTodos, toolHint, textOfMessage } from '../lib/activity.js';
+import { PRIORITY, createSessionState, drain, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage } from '../lib/activity.js';
 import { ruleSummary, buildPrompt } from '../lib/summarize.js';
 import { buildSpawnSpec, buildSpeechArgv, createSpeechEngine, resolveEnginePath } from '../lib/engine.js';
 import { expandHome, readField, resolveConfig } from '../lib/index.js';
@@ -847,6 +847,98 @@ await test('静默心跳守卫：没有活动不报（防"卡住了还硬说在�
   await tick(800);                         // 只有 turn/start，没有任何工具调用
   assert.equal(subprocess.calls.length, 0, '没有活动时绝不该播心跳');
   ctx.disposeAll();
+});
+
+// ── 回归：阻塞型工具调用期间的整段静默（2026-10-01 实测 187 秒）─────────────
+// 实测现场：`bash {"command":"sleep 180; echo waited"}` 发出后，飞行期内零会话事件；
+// 而前一次播报的 drain() 已把这条 tool/call 从缓冲抽走 → 守卫判"没活动" →
+// 连续 10 个 tick 全部沉默（14:28:25→14:31:33）。下面是这对行为的成对回归。
+
+await test('回归 187s 静默：长工具调用飞行期内，缓冲被 drain 抽干后仍必须报', async () => {
+  const subprocess = fakeSubprocess();
+  const llm = fakeLlm({ text: '还在等，没有卡住。' });
+  const ctx = fakeCtx({ subprocess, llm });
+  apply(ctx, HCFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, {
+    type: 'tool/call',
+    data: { callId: 'call_sleep', name: 'bash', arguments: JSON.stringify({ command: 'sleep 180; echo waited' }) },
+  });
+  await tick(900);                          // 第一次心跳：来自缓冲里的那条 tool/call
+  const afterFirst = subprocess.calls.length;
+  assert.ok(afterFirst >= 1, '第一次心跳应播');
+  // 关键：此后不再产生任何会话事件，完全复刻 sleep 飞行期
+  await tick(900);
+  assert.ok(
+    subprocess.calls.length > afterFirst,
+    `缓冲被抽干后，长调用的飞行期仍必须报心跳（旧代码在这里整段静默）：${subprocess.calls.length}`,
+  );
+  const prompt = llm.seen.at(-1).messages[0].content[0].text;
+  assert.ok(prompt.includes('仍在执行'), `摘要必须拿到"在飞调用"这条如实描述：${prompt}`);
+  assert.ok(prompt.includes('sleep 180'), `描述里要带上真正在跑的命令：${prompt}`);
+  ctx.disposeAll();
+});
+
+await test('回归 187s 静默的边界：调用已结束且无新事件 → 必须恢复沉默', async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '还在跑。' }) });
+  apply(ctx, HCFG);
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { callId: 'c1', name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'tool/result', data: { toolCallId: 'c1', message: { source: { kind: 'tool', callId: 'c1' } } } });
+  await tick(900);                          // 至多一次（缓冲里还留着那条 tool/call）
+  const afterSettle = subprocess.calls.length;
+  assert.ok(afterSettle <= 1, `调用结束后不该反复报：${afterSettle}`);
+  await tick(900);
+  assert.equal(
+    subprocess.calls.length,
+    afterSettle,
+    '调用已结束、又无新事件 → 在飞计数必须归零，真卡住时要能沉默（不能为了填静默而永远报）',
+  );
+  ctx.disposeAll();
+});
+
+await test('在飞调用：按 callId 精确配对，乱序返回也不会错销', () => {
+  const s = createSessionState('s');
+  const cfg = { toolErrorIgnoreCodes: [] };
+  noteEvent(s, { type: 'tool/call', data: { callId: 'a', name: 'bash' } }, cfg);
+  noteEvent(s, { type: 'tool/call', data: { callId: 'b', name: 'web_fetch' } }, cfg);
+  assert.deepEqual(s.inFlightCalls.map((c) => c.callId), ['a', 'b'], '两个调用都应在飞');
+  noteEvent(s, { type: 'tool/result', data: { toolCallId: 'b', message: { source: { kind: 'tool', callId: 'b' } } } }, cfg);
+  assert.deepEqual(s.inFlightCalls.map((c) => c.callId), ['a'], '先回来的 b 被销掉，a 仍在飞');
+  noteEvent(s, { type: 'tool/result', data: { toolCallId: 'a' } }, cfg);
+  assert.equal(s.inFlightCalls.length, 0, 'a 回来后应彻底归零');
+  // 报错的结果同样要销账，否则计数只增不减 → 永远"有活在跑"
+  noteEvent(s, { type: 'tool/call', data: { callId: 'c', name: 'bash' } }, cfg);
+  noteEvent(s, { type: 'tool/result', data: { toolCallId: 'c', error: { code: 'E_TOOL' } } }, cfg);
+  assert.equal(s.inFlightCalls.length, 0, '失败的结果也必须销掉在飞调用');
+});
+
+await test('在飞调用：turn/start 与 turn/end 都清空（中断留下的幽灵不许点亮心跳）', () => {
+  const s = createSessionState('s');
+  const cfg = { announceTurnEnd: true, turnEndMinToolCalls: 1 };
+  noteEvent(s, { type: 'tool/call', data: { callId: 'a', name: 'bash' } }, cfg);
+  assert.equal(s.inFlightCalls.length, 1, '调用应在飞');
+  noteEvent(s, { type: 'turn/end', data: { reason: { kind: 'completed' } } }, cfg);
+  assert.equal(s.inFlightCalls.length, 0, '轮次结束时在飞记录必须清空');
+  noteEvent(s, { type: 'turn/start', data: { turn: 2 } }, cfg);
+  noteEvent(s, { type: 'tool/call', data: { callId: 'b', name: 'bash' } }, cfg);
+  noteEvent(s, { type: 'turn/start', data: { turn: 3 } }, cfg);
+  assert.equal(s.inFlightCalls.length, 0, '新一轮开头也必须清空上一轮的残留');
+});
+
+await test('在飞调用：描述如实带出"在跑什么 + 等了多久 + 并发几个"', () => {
+  const s = createSessionState('s');
+  noteEvent(s, { type: 'tool/call', data: { callId: 'a', name: 'bash', arguments: JSON.stringify({ command: 'sleep 180; echo waited' }) } }, {});
+  const line = pendingWorkLine(s, s.inFlightCalls[0].at + 178000);
+  assert.ok(line.includes('仍在执行'), `应说清还在跑：${line}`);
+  assert.ok(line.includes('sleep 180'), `应带上真正在跑的命令：${line}`);
+  assert.ok(line.includes('178 秒'), `应如实报等待时长：${line}`);
+  noteEvent(s, { type: 'tool/call', data: { callId: 'b', name: 'web_fetch' } }, {});
+  assert.ok(pendingWorkLine(s, s.inFlightCalls[0].at).includes('另有 1 个调用同时在跑'), '并发时要说明还有别的在跑');
+  assert.equal(pendingWorkLine(createSessionState('empty')), '', '没有在飞调用时返回空串');
 });
 
 await test('静默心跳守卫：轮次已结束不报', async () => {

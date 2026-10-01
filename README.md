@@ -187,12 +187,31 @@ Announcement text **leaves this machine**. When needed, copy `engine/minimax-red
 | Too chatty | Raise `minGapMs` / `stageToolCalls`, turn off `announceTurnEnd` |
 | Saying the wrong thing | Set `logAnnouncements: true` and check the host log, or read the text actually spoken in `logFile` |
 | Cloud engine not taking effect | Check `~/.dsh/logs/minimax-speak.log` for `fallback` lines — the most common cause is a missing key |
+| **Long silence (minutes) with no announcement** | Look at the `boundary` lines **inside** the gap. **None at all** → the decision layer never fired (the "no activity" guard suppressed it); if there *was* activity, that is the v1.2.1 in-flight fix — see below. `boundary` present but no `announce`/`coalesced`/`dropped`/`pipeline-error` → broken channel contract, please report it |
+
+### Why a blocking tool call used to go silent (fixed in v1.2.1)
+
+Measured on a real session (2026-10-01): the assistant issued `bash {"command":"sleep 180"}`.
+A blocking call emits **no session events while it is in flight** — no `tool/result` (it has not returned),
+no `assistant/message` (the model is not generating). The heartbeat guard only looked at the activity
+buffer and a counter that the **previous announcement's `drain()` had just cleared**, so it concluded
+"no activity" and suppressed **10 consecutive ticks** — **187 seconds of total silence** while the task
+was in fact progressing (two background subagents delivered results in the middle of it).
+
+v1.2.1 fixes it by tracking **in-flight tool calls** as a first-class activity signal that `drain()`
+never clears, and by feeding the summarizer an honest line (`still running bash (sleep 180…), 94s elapsed`)
+when the buffer is empty.
+
+**The guard is deliberately still strict**: when nothing is in flight and no events arrive, the plugin
+stays silent — it will not invent "working hard" to fill a gap. Consequence you should know:
+a single **very long model generation** (minutes with no tool call, no message) still has no signal to
+report, and remains a known silent window.
 
 ## Development
 
 ```bash
 pnpm install          # install devDependencies (real @deepseek-ai/* packages)
-npm test              # 59 offline unit tests, no DSH required
+npm test              # 66 offline unit tests, no DSH required
 npm run check-secrets # must run before committing: secrets and privacy guard
 npm run replay -- <session log> --verbose   # replay a real session
 ```
