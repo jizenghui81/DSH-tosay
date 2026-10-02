@@ -15,5 +15,8 @@ minimax-redact.txt
 *.log
 .cache/
 
+# 编译产物：音频内核在本机用 engine/build-audio-core.sh 构建（平台相关，不入库）
+engine/audio-core
+
 # macOS
 .DS_Store

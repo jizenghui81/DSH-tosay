@@ -34,6 +34,9 @@ The five functional layers are independent and individually replaceable (`lib/in
 | `lib/engine.js` | Serial speech queue + platform argv + engine path resolution | `subprocess` service |
 | `lib/clean.js` | Markdown → speakable text | None |
 | `lib/journal.js` | Announcement audit log | `node:fs` |
+| `lib/audio-core.js` | Audio-core child process client (JSON Lines over stdin/stdout) | `subprocess` service |
+| `lib/duplex.js` | Full-duplex: read the utterance WAV → local recogniser → inject as a user message | `speechToText`, `agents` (both optional, via `ctx.get()`) |
+| `lib/client.js` | Browser half: the plugin-page panel (hand-written bundle, no build step) | Client `slots` / `locale` / `configForms` |
 
 **Bottom line**: any step that fails only writes a log entry. Announcements are a nice-to-have and never affect the session.
 
@@ -59,6 +62,69 @@ Sessions that already existed before the install receive no events either; only 
 - DSH `>= 0.1.7-rc.1` (`dsh.engines` in `package.json` declares the exact range)
 - macOS: the built-in `say` — **works out of the box, no key of any kind**
 - Windows: `powershell` + `System.Speech` (Windows 11 ships natural voices; Windows 10 needs NaturalVoiceSAPIAdapter)
+
+## Duplex modes (the plugin-page panel)
+
+Open **Settings → Plugins → dsh-stage-speak**. The panel groups all 30 user-facing options into five
+sections, with a **Restore all defaults** button. The top control is a four-position mode switch:
+
+| Mode | What it does | Microphone |
+|---|---|---|
+| **Original** (default) | Announces exactly as before; no duplex at all | not opened |
+| **Half duplex** | You start talking → the announcement stops instantly and yields | opened (voice-activity only) |
+| **Full duplex** | You talk → yields → local recognition → your words enter the session as **your message** | opened (records utterances) |
+| **Muted** | Fully disabled (same as `enabled: false`) | not opened |
+
+**Original is the default on purpose**: with no switch flipped, the plugin behaves exactly as it did
+before duplex existed. Duplex is opt-in.
+
+The mode switch takes effect **immediately** — no host restart. (DSH's settings save is a *volatile
+in-place update* that does **not** re-run `apply()`, so the plugin reads the live config
+(`ctx.fiber.config`), listens for `loader/volatile-update`, and keeps a 1.5 s differential watchdog
+as a backstop.)
+
+### Half duplex: why it needs an audio core
+
+The audio core (`engine/audio-core`, a small Swift program; build with `engine/build-audio-core.sh`)
+owns the microphone **and** playback. That is not incidental: macOS's voice processing (AEC) only
+cancels the speaker's echo when playback and capture live in the same `AVAudioEngine`, which is what
+lets the plugin hear you **while it is speaking through the speakers**. Measured on real hardware, the
+echo sits only ~5.5 dB above the noise floor.
+
+Barge-in itself is fast (measured 1–2 ms) because playback is stopped in-process rather than by
+killing a subprocess.
+
+**Known limit, stated plainly**: with no speech recognition in this mode, a level-based detector
+cannot tell "you talking" from "room noise / residual echo". Mis-triggers are therefore not
+eliminated — they are made **harmless** (the worst case is one skipped announcement) and tunable
+(`bargeInOverDb`, `bargeInOverDbPlaying`, `bargeInReleaseMs`).
+
+### Full duplex: local recognition, no audio leaves the machine
+
+The core writes each utterance as a 16 kHz mono PCM16 WAV (**peak-normalised first** — raw mic level
+was low enough that the recogniser returned empty text) and reports its path. The host half then:
+
+1. reads the WAV,
+2. calls the **local** recogniser through `ctx.speechToText` (SenseVoice, CPU, offline),
+3. injects the transcript as a real `user/message` via `agent.steer` (configurable: `steer` inserts
+   at the next step boundary without interrupting an in-flight request; `followup` queues a new turn).
+
+**Anti-echo guard** (`duplexEchoGuard`, on by default): announcements get picked up by the microphone
+and re-recognised as *your* words — observed on real hardware (announce at 07:03:47 → duplicate
+injection at 07:03:50). Two layers, both needed:
+
+| Layer | Where | What |
+|---|---|---|
+| 1 | kernel | A **post-playback cooldown** (1.5 s) keeps the stricter playing-mode threshold, and tags utterances that began inside it |
+| 2 | plugin | Similarity check against **what it just said** (character-bigram Dice ≥ 0.72, 20 s window). Older speech is *not* matched — you repeating something from a minute ago is legitimate |
+
+`steer`/`followup`/`inject` were verified for what they actually do: all three eventually append a
+real `user/message`; `steer` does **not** abort an in-flight model request, and `inject` does not wake
+the agent at all.
+
+⚠️ The optional services are fetched with `ctx.get()`, deliberately **not** listed in `inject`:
+cordis's `inject` has no optional semantics, so naming a missing service would keep the **whole
+plugin** inactive — including plain announcements on machines without the speech bundle.
 
 ## Configuration
 

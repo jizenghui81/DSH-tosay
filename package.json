@@ -1,7 +1,7 @@
 {
   "name": "dsh-stage-speak",
-  "version": "1.5.1",
-  "description": "DSH 阶段摘要语音播报：在每个阶段边界用模型把进展压成一句人话，再经语音引擎念出来",
+  "version": "1.8.2",
+  "description": "DSH 阶段摘要语音播报：阶段边界念一句人话；插件页配置面板；四档双工（原始/半双工/全双工/静音），半双工开口即让路，全双工本地识别+注入会话",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -17,11 +17,14 @@
     ".": {
       "default": "./lib/index.js"
     },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./engine/*": "./engine/*",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "//dsh": "profile bundle 声明：声明了 dsh.bundle 的依赖会被 launcher 自动挂载，装完即生效。engines.dsh 让旧宿主拿到明确信号而不是静默失效。",
+  "//dsh": "profile bundle 声明：声明了 dsh.bundle 的依赖会被 launcher 自动挂载，装完即生效。engines.dsh 让旧宿主拿到明确信号而不是静默失效。dsh.client 声明浏览器半边（手写 bundle，无构建步骤）。",
   "dsh": {
     "manifestVersion": 1,
     "engines": {
@@ -29,6 +32,15 @@
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "//peerDependencies": "按官方《打包与安装插件》的要求，需要与宿主共享实例的 dsh 包要同时声明在 peerDependencies 与 devDependencies：peer 给出兼容性信号，dev 供类型检查与独立测试。实测（2026-10-01，pnpm 10.33.2）：在 profile 的 pnpm-workspace.yaml 设 autoInstallPeers: false 的前提下，声明 peer 只产生一条 WARN 列出期望的宿主包，不会联网拉取、不会导致安装失败。",

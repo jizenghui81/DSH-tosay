@@ -12,9 +12,17 @@
 #
 # 任何一步失败 → 回退系统 say，保证"必出声"。绝不向上抛错。
 #
+# 两种运行模式：
+#   默认        —— 合成完**自己播**（afplay），保证"必出声"
+#   MMX_SYNTH_ONLY=1 —— **只合成不播放**：把 mp3 的绝对路径打到 stdout 一行，交给调用方播放。
+#                        半双工 barge-in 走这条：只有音频内核播出来的声音才带 AEC 参考，
+#                        能被自己的 VAD 消掉回声；afplay 播的声音内核看不见，会被当成"你说话了"。
+#                        该模式下失败回退**不发声**（否则 barge-in 语义自相矛盾），
+#                        改为打 stderr + 非零退出码，让 Node 侧知道"没合成出来"。
+#
 # 配置优先级（高 → 低）：
 #   1) 环境变量    MMX_MODEL / MMX_VOICE / MMX_FALLBACK_VOICE / MMX_SPEED / MMX_CACHE_MAX
-#                  MINIMAX_API_KEY（密钥）· MMX_CONFIG（mmx 配置文件路径）
+#                  MMX_SYNTH_ONLY（只合成不播放）· MINIMAX_API_KEY（密钥）· MMX_CONFIG（mmx 配置文件路径）
 #   2) 用户覆盖文件 ~/.dsh/tools/minimax-{model,voice}.txt
 #   3) 包内默认文件 <本脚本同目录>/minimax-{model,voice}.txt   ← 随插件包分发，自包含
 #   4) 内置默认
@@ -53,6 +61,8 @@ VOICE=$(read_conf "${MMX_VOICE:-}" "$HOME/.dsh/tools/minimax-voice.txt" "$SELF_D
 FALLBACK_VOICE="${MMX_FALLBACK_VOICE:-Tingting}"
 SPEED="${MMX_SPEED:-1.0}"
 CACHE_MAX="${MMX_CACHE_MAX:-300}"
+# 「只合成不播放」开关：见文件头说明。任何非 "1" 的值都按老行为（自己播）。
+SYNTH_ONLY="${MMX_SYNTH_ONLY:-0}"
 
 log() {
   # 调用方传的是字面量 \t，printf 的 %s 不解释它 —— 这里手动换成真制表符
@@ -79,6 +89,8 @@ HASH=$(printf '%s|%s|%s' "$MODEL" "$VOICE" "$TEXT" | shasum -a 256 | cut -c1-32)
 MP3="$CACHE/$HASH.mp3"
 if [ -s "$MP3" ]; then
   log "cache-hit\t${HASH}\t${MODEL}"
+  # synth-only：只交路径，绝不在这里出声（出声会绕过内核 AEC 的回声参考）。
+  if [ "$SYNTH_ONLY" = "1" ]; then printf '%s\n' "$MP3"; exit 0; fi
   afplay "$MP3" 2>/dev/null
   exit 0
 fi
@@ -86,6 +98,13 @@ fi
 # ── 回退：系统 say（任何失败都走这里，保证必出声）───────────────────────
 fallback() {
   log "fallback\t$1"
+  # synth-only 下**不能**出声：调用方（音频内核路径）靠 stdout 的路径决定播什么，
+  # 这里偷偷 say 一句会让"你说话时立刻停下"变成两路声音打架。
+  # 于是改为 stderr + 非零码，让 Node 侧明确知道"这次没合成出来"。
+  if [ "$SYNTH_ONLY" = "1" ]; then
+    printf 'minimax-speak: 合成失败，synth-only 模式不出声：%s\n' "$1" >&2
+    exit 1
+  fi
   /usr/bin/say -v "$FALLBACK_VOICE" "$TEXT" 2>/dev/null || /usr/bin/say "$TEXT" 2>/dev/null
   exit 0
 }
@@ -142,6 +161,12 @@ COUNT=$(ls -1 "$CACHE"/*.mp3 2>/dev/null | wc -l | tr -d ' ')
 if [ "$COUNT" -gt "$CACHE_MAX" ]; then
   ls -1t "$CACHE"/*.mp3 2>/dev/null | tail -n +$((CACHE_MAX + 1)) | while read -r f; do rm -f "$f"; done
   log "prune\t$COUNT -> $CACHE_MAX"
+fi
+
+# synth-only：把绝对路径交给调用方（Node 侧）去播；否则自己播。
+if [ "$SYNTH_ONLY" = "1" ]; then
+  printf '%s\n' "$MP3"
+  exit 0
 fi
 
 afplay "$MP3" 2>/dev/null

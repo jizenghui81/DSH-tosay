@@ -9,10 +9,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { cleanForSpeech, truncateForSpeech } from '../lib/clean.js';
 import { APPROVAL_SIGNAL, ASK_USER_SIGNAL, PRIORITY, cleanApprovalReason, closerFor, createSessionState, describeTool, drain, formatDuration, noteEvent, pendingWorkLine, readTodos, toolHint, textOfMessage, waitingLine } from '../lib/activity.js';
 import { ruleSummary, buildPrompt } from '../lib/summarize.js';
 import { buildSpawnSpec, buildSpeechArgv, createSpeechEngine, resolveEnginePath } from '../lib/engine.js';
+import { createAudioCore } from '../lib/audio-core.js';
+import { createDuplex } from '../lib/duplex.js';
 import { composeAnnouncement, expandHome, readField, resolveConfig } from '../lib/index.js';
 
 let passed = 0;
@@ -56,24 +59,59 @@ function assertConformantSpawnSpec(spec) {
   if (spec.env !== undefined) assert.ok(typeof spec.env === 'object' && spec.env !== null, 'env 必须是对象');
 }
 
-/** 造一个假的子进程服务，记录每次 spawn 的 argv，并校验契约。 */
-function fakeSubprocess({ hold = 0, throwOnSpawn = null } = {}) {
+/**
+ * 造一个假的子进程服务，记录每次 spawn 的 argv，并校验契约。
+ *
+ * 两类子进程分开记：
+ *   `calls`     —— **单向**播报子进程（wrapper / say）：stdin 'ignore'，只关心它念了什么。
+ *   `coreCalls` —— **双向**音频内核：stdin 与 stdout 都是 'pipe'（JSON Lines 协议）。
+ * 分开是必要的：内核是 apply 时就拉起的常驻进程，若混进 `calls`，所有
+ * "播报了几次"的断言都会被它污染（它不是一个播报）。
+ *
+ * @param {object} [options] - hold=子进程存活毫秒；throwOnSpawn=强制抛错；
+ *   stdoutText=单向子进程的 stdout 内容；exitCode=退出码。
+ */
+function fakeSubprocess({ hold = 0, throwOnSpawn = null, stdoutText = '', exitCode = 0 } = {}) {
   const calls = [];
+  const coreCalls = [];
+  const kernels = [];
   return {
     calls,
+    coreCalls,
+    kernels,
     resolveExecutable: async (command) => `/usr/bin/${command}`,
     spawn(spec) {
       assertConformantSpawnSpec(spec);
       if (throwOnSpawn !== null) throw throwOnSpawn;
+      // 双向管道 = 音频内核：给它一对真的 PassThrough，让客户端能正常读写协议。
+      if (spec.stdio?.stdin === 'pipe' && spec.stdio?.stdout === 'pipe') {
+        coreCalls.push(spec);
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        // 记下来，端到端用例要**从内核侧**发 utterance-file 事件。
+        kernels.push({ spec, stdin, stdout, stderr });
+        return {
+          stdin,
+          stdout,
+          stderr,
+          done: new Promise(() => {}), // 常驻：不主动退出
+          collected: {},
+          terminate: () => {},
+        };
+      }
       calls.push(spec);
       let resolveDone;
       const done = new Promise((resolve) => { resolveDone = resolve; });
-      const finish = () => resolveDone({ exitCode: 0, signal: null });
+      const finish = () => resolveDone({ exitCode, signal: null });
       if (hold === 0) setTimeout(finish, 0);
       else setTimeout(finish, hold);
       return {
         done,
-        collected: { stdout: { readFrom: () => ({ text: '' }) }, stderr: { readFrom: () => ({ text: '' }) } },
+        collected: {
+          stdout: { readFrom: () => ({ text: stdoutText }) },
+          stderr: { readFrom: () => ({ text: '' }) },
+        },
         terminate: () => { resolveDone({ exitCode: null, signal: 'SIGTERM' }); },
       };
     },
@@ -81,7 +119,7 @@ function fakeSubprocess({ hold = 0, throwOnSpawn = null } = {}) {
 }
 
 /** 造一个假的 cordis 上下文。 */
-function fakeCtx({ subprocess, llm, defaultSelection } = {}) {
+function fakeCtx({ subprocess, llm, defaultSelection, agents, speechToText } = {}) {
   const handlers = new Map();
   const disposers = [];
   return {
@@ -90,6 +128,8 @@ function fakeCtx({ subprocess, llm, defaultSelection } = {}) {
     logger: { info: () => {}, warn: () => {} },
     get(name) {
       if (name === 'llm') return llm;
+      if (name === 'agents') return agents;
+      if (name === 'speechToText') return speechToText;
       if (name === 'agentDefaultModel') return defaultSelection === undefined ? undefined : { currentSelection: () => defaultSelection };
       return undefined;
     },
@@ -382,6 +422,434 @@ await test('spawn 抛错时不再静默：lastError 有值且 onError 被调用'
   engine.dispose();
 });
 
+console.log('\n── 5c. barge-in（音频内核接入）──');
+
+/** 引擎测试共用的最小配置。 */
+const ENGINE_CFG = { engine: '', voice: '', rate: 0, volume: 100, graceMs: 10, speakTimeoutMs: 5000 };
+
+/** 造一个假音频内核客户端：记录 play/stop，并允许手动 emit 事件（模拟内核上报 voice）。 */
+function fakeAudioCore({ holdPlay = false } = {}) {
+  const handlers = new Map();
+  const played = [];
+  const stops = [];
+  let disposed = false;
+  return {
+    played,
+    stops,
+    isDisposed: () => disposed,
+    on(kind, handler) {
+      const list = handlers.get(kind) ?? [];
+      list.push(handler);
+      handlers.set(kind, list);
+    },
+    emit(kind, payload) { for (const handler of handlers.get(kind) ?? []) handler(payload); },
+    play(audioPath, id) {
+      played.push({ path: audioPath, id });
+      // holdPlay：模拟"内核正在播"，只有 stop/超时才会 settle。
+      return holdPlay ? new Promise(() => {}) : Promise.resolve({ status: 'finished', id });
+    },
+    stop(reason) { stops.push(reason); },
+    dispose() { disposed = true; },
+    stats: () => ({ alive: true, ready: true, playing: false }),
+  };
+}
+
+/** 造一个会真的给双向管道的 fake subprocess，用来单测 lib/audio-core.js 的协议。 */
+function fakeStreamSubprocess() {
+  const calls = [];
+  const written = [];
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  stdin.on('data', (chunk) => written.push(String(chunk)));
+  return {
+    calls,
+    written,
+    stdin,
+    stdout,
+    stderr,
+    resolveExecutable: async (command) => `/usr/bin/${command}`,
+    spawn(spec) {
+      assertConformantSpawnSpec(spec);
+      calls.push(spec);
+      return { stdin, stdout, stderr, done: new Promise(() => {}), collected: {}, terminate: () => {} };
+    },
+  };
+}
+
+await test('内核路径①：audioCore 为 null 时完全走老路径（wrapper 自播）', async () => {
+  const subprocess = fakeSubprocess();
+  const engine = createSpeechEngine({ subprocess, logger: { warn: () => {} }, config: ENGINE_CFG });
+  engine.speak('老路径照旧');
+  await tick(40);
+  assert.equal(subprocess.calls.length, 1, `应只播一次：${subprocess.calls.length}`);
+  assert.equal(subprocess.calls[0].env, undefined, '老路径不该下发 MMX_SYNTH_ONLY');
+  assert.equal(subprocess.calls[0].argv.at(-1), '老路径照旧');
+  assert.equal(engine.stats().spoken, 1);
+  engine.dispose();
+});
+
+await test('内核路径②：给了 audioCore 就走 synth-only 合成 + 内核播放', async () => {
+  const subprocess = fakeSubprocess({ stdoutText: '/tmp/dsh-stage-speak-test.mp3\n' });
+  const core = fakeAudioCore();
+  const engine = createSpeechEngine({ subprocess, logger: { warn: () => {} }, config: ENGINE_CFG, audioCore: core });
+  engine.speak('交给内核播');
+  await tick(60);
+  assert.equal(subprocess.calls.length, 1, '合成仍是一次子进程调用');
+  assert.equal(subprocess.calls[0].env?.MMX_SYNTH_ONLY, '1', 'wrapper 必须只合成不播放');
+  assert.equal(subprocess.calls[0].argv.at(-1), '交给内核播', '文本仍走 argv');
+  assert.equal(subprocess.coreCalls.length, 0, '内核由 index 侧创建，engine 不该再 spawn 内核');
+  assert.equal(core.played.length, 1, '应把合成结果交给内核播');
+  assert.equal(core.played[0].path, '/tmp/dsh-stage-speak-test.mp3');
+  assert.equal(engine.stats().spoken, 1);
+  engine.dispose();
+});
+
+await test('内核路径③：voice 事件 → onBargeIn + interrupt（清队列、内核收 stop）', async () => {
+  const subprocess = fakeSubprocess({ stdoutText: '/tmp/a.mp3\n' });
+  const core = fakeAudioCore({ holdPlay: true });
+  const barges = [];
+  const engine = createSpeechEngine({
+    subprocess,
+    logger: { warn: () => {} },
+    config: ENGINE_CFG,
+    audioCore: core,
+    onBargeIn: (event) => barges.push(event),
+  });
+  engine.speak('正在念的一句');
+  engine.speak('还在排队的下一句');
+  await tick(60);
+  assert.equal(core.played.length, 1, `第一条应已交给内核：${core.played.length}`);
+
+  core.emit('voice', { ev: 'voice', level: -44.9 });
+  await tick(10);
+  assert.equal(barges.length, 1, 'onBargeIn 必须被调用');
+  assert.equal(barges[0].level, -44.9, '事件原样透传给 onBargeIn');
+  assert.ok(core.stops.includes('barge-in'), `内核应收到 stop(barge-in)：${JSON.stringify(core.stops)}`);
+  assert.equal(engine.stats().queued, 0, '在排队的播报必须让路');
+  assert.ok(engine.stats().interrupted >= 1, '应记一次打断');
+  engine.dispose();
+});
+
+await test('内核路径④：interrupt 清空队列且不抛错（有/无内核两种）', async () => {
+  const subprocess = fakeSubprocess({ hold: 200 });
+  const plain = createSpeechEngine({ subprocess, logger: { warn: () => {} }, config: ENGINE_CFG });
+  plain.speak('第一句');
+  plain.speak('第二句');
+  await tick(5);
+  assert.doesNotThrow(() => plain.interrupt('barge-in'));
+  assert.equal(plain.stats().queued, 0, '队列应被清空');
+  assert.ok(plain.stats().dropped >= 1, '被清掉的应计入 dropped');
+  plain.dispose();
+
+  const subprocess2 = fakeSubprocess({ stdoutText: '/tmp/b.mp3\n' });
+  const core = fakeAudioCore({ holdPlay: true });
+  const kernel = createSpeechEngine({ subprocess: subprocess2, logger: { warn: () => {} }, config: ENGINE_CFG, audioCore: core });
+  kernel.speak('甲');
+  kernel.speak('乙');
+  await tick(60);
+  assert.doesNotThrow(() => kernel.interrupt('barge-in'));
+  assert.equal(kernel.stats().queued, 0, '内核路径下队列同样要清空');
+  assert.ok(core.stops.includes('barge-in'));
+  kernel.dispose();
+});
+
+await test('内核客户①：内核不存在时返回 null 并留日志（优雅降级）', () => {
+  const warns = [];
+  const core = createAudioCore({
+    subprocess: fakeSubprocess(),
+    logger: { warn: (message) => warns.push(String(message)) },
+    config: { audioCorePath: './engine/definitely-not-built', cwd: '', graceMs: 10 },
+  });
+  assert.equal(core, null, '内核不存在必须返回 null，而不是半个可用对象');
+  assert.ok(warns.some((message) => message.includes('内核不存在')), `应 warn：${JSON.stringify(warns)}`);
+});
+
+await test('内核客户②：解析 JSON Lines、派发事件、play/stop/quit 走协议', async () => {
+  const subprocess = fakeStreamSubprocess();
+  const voices = [];
+  let readyCount = 0;
+  // 用一个**一定存在**的包内文件当替身：本用例只验证客户端协议，spawn 是假的。
+  // （真内核 engine/audio-core 是编译产物、不入库，不能当测试前置条件。）
+  const core = createAudioCore({
+    subprocess,
+    logger: { warn: () => {} },
+    config: { audioCorePath: './engine/minimax-speak.sh', cwd: '', graceMs: 10, bargeInOverDb: 11, bargeInReleaseMs: 640 },
+    onReady: () => { readyCount += 1; },
+  });
+  assert.ok(core !== null, '内核存在时应返回客户端');
+  assert.equal(subprocess.calls.length, 1);
+  assert.ok(subprocess.calls[0].cwd.length > 0, 'cwd 必填（漏了 spawn 会同步抛错）');
+  assert.equal(subprocess.calls[0].env.VAD_OVER_DB, '11', 'bargeInOverDb 应下发 VAD_OVER_DB');
+  assert.equal(subprocess.calls[0].env.VAD_RELEASE_FRAMES, '30', '640ms ≈ 30 帧（1024 帧 @48k）');
+
+  core.on('voice', (event) => voices.push(event));
+  subprocess.stdout.write(`${JSON.stringify({ ev: 'ready', sampleRate: 48000 })}\n`);
+  subprocess.stdout.write('这不是 JSON\n');
+  subprocess.stdout.write(`${JSON.stringify({ ev: 'voice', level: -44.9 })}\n`);
+  await tick(10);
+  assert.equal(core.stats().ready, true, '应收到 ready');
+  assert.equal(readyCount, 1, '命名回调 onReady 与 on(kind) 两种写法都要生效');
+  assert.equal(voices.length, 1, '非 JSON 行必须被跳过，不能污染事件流');
+  assert.equal(voices[0].level, -44.9);
+
+  const playing = core.play('/tmp/abc.mp3', 'say-1');
+  assert.ok(subprocess.written.join('').includes('"cmd":"play"'), 'play 应写成 JSON Lines');
+  subprocess.stdout.write(`${JSON.stringify({ ev: 'finished', id: 'say-1' })}\n`);
+  const outcome = await playing;
+  assert.equal(outcome.status, 'finished', 'finished 应 settle 对应的 play');
+  core.stop('barge-in');
+  assert.ok(subprocess.written.join('').includes('"reason":"barge-in"'), 'stop 应带上 reason');
+  core.dispose();
+  assert.ok(subprocess.written.join('').includes('"cmd":"quit"'), 'dispose 应下发 quit');
+  assert.equal(core.stats().alive, false);
+});
+
+console.log('\n── 5d. 全双工（mode: full：分句落盘 → 本地识别 → 注入）──');
+
+/**
+ * 造一个假 speechToText：契约与官方 sensevoice provider 对齐（不是想当然写的）。
+ * 已核实的官方实现（app.asar 里 @deepseek-ai/dsh-experimental-speech-to-text + -sensevoice）：
+ *   - `resolve({audio, language})` 对 language 有**白名单校验**，不在名单里直接抛；
+ *   - `transcribe(spec, signal)` 第一行就是 `signal.throwIfAborted()` —— signal 必填；
+ *   - 返回 `{ text, audioSeconds, inferenceSeconds }`（zod `.strict()`）。
+ */
+function fakeSpeechToText({ text = '帮我把构建脚本跑一遍', fail = false } = {}) {
+  const resolved = [];
+  const transcribed = [];
+  const languages = ['auto', 'zh', 'en', 'yue', 'ja', 'ko'];
+  return {
+    resolved,
+    transcribed,
+    resolve(request) {
+      resolved.push(request);
+      if (!languages.includes(request.language)) {
+        throw new Error(`Speech provider sensevoice-local does not support language: ${request.language}`);
+      }
+      return { provider: { info: { id: 'sensevoice-local' } }, audio: request.audio, language: request.language };
+    },
+    async transcribe(spec, signal) {
+      signal.throwIfAborted();
+      transcribed.push(spec);
+      if (fail) throw new Error('inference exploded');
+      return { text, audioSeconds: 1.2, inferenceSeconds: 0.3 };
+    },
+  };
+}
+
+/** 造一个假 agents：记录 steer / followup。 */
+function fakeAgents() {
+  const steered = [];
+  const followed = [];
+  return {
+    steered,
+    followed,
+    get(id) {
+      return {
+        steer: (message) => steered.push({ id, message }),
+        followup: (message) => followed.push({ id, message }),
+      };
+    },
+  };
+}
+
+/**
+ * 断言注入的是**完整 UserMessage**。
+ *
+ * 依据是 `dsh-session` 的 `assertMessageEventShape()`（我逐字读过）：
+ * `id` 非空 string、`role === 'user'`、`source.kind` 非空 string、`content` 必须是数组。
+ * 传纯字符串会在 `user/message` 事件落库时被直接拒。
+ */
+function assertUserMessageShape(message) {
+  assert.ok(message !== null && typeof message === 'object', '必须是对象（纯字符串会被 dsh-session 拒）');
+  assert.equal(typeof message.id, 'string', 'id 必须是 string');
+  assert.ok(message.id.length > 0, 'id 不能是空串');
+  assert.equal(message.role, 'user', 'role 必须是 user');
+  assert.ok(Array.isArray(message.content), 'content 必须是数组');
+  assert.equal(message.content[0]?.type, 'text', 'content[0] 必须是 text 块');
+  assert.equal(typeof message.content[0]?.text, 'string');
+  assert.equal(typeof message.source?.kind, 'string', 'source.kind 必须存在');
+  assert.ok(message.source.kind.length > 0, 'source.kind 不能是空串');
+}
+
+/** 全双工单测的公共依赖：假的读/删（避免测试依赖真实文件）。 */
+function duplexHarness({
+  text = '帮我把构建脚本跑一遍',
+  fail = false,
+  missingFile = false,
+  service = true,
+  config = {},
+  utteranceDir = '',
+  recentSpeech = undefined,
+} = {}) {
+  const removed = [];
+  const read = [];
+  const speechToText = fakeSpeechToText({ text, fail });
+  const agents = fakeAgents();
+  const duplex = createDuplex({
+    speechToText: service ? speechToText : undefined,
+    logger: { warn: () => {} },
+    config: { duplexLanguage: 'zh', duplexInjectMode: 'steer', ...config },
+    utteranceDir,
+    resolveTarget: () => ({ sessionId: 's1', agent: agents.get('s1') }),
+    ...(recentSpeech === undefined ? {} : { recentSpeech }),
+    readAudio: async (path) => {
+      read.push(path);
+      if (missingFile) throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+      return Buffer.from('RIFF....WAVE');
+    },
+    removeAudio: async (path) => { removed.push(path); },
+  });
+  return { duplex, speechToText, agents, removed, read };
+}
+
+await test('全双工①：识别文本经 steer 注入，且是完整 UserMessage', async () => {
+  const h = duplexHarness();
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/utt-000001.wav', id: 'utt-000001.wav', seconds: 2.1 });
+  assert.equal(outcome.status, 'injected', `应注入，实际 ${outcome.status}`);
+  assert.equal(h.speechToText.resolved.length, 1, '应调一次 resolve');
+  assert.equal(h.speechToText.resolved[0].language, 'zh', 'language 必须原样透传');
+  assert.ok(Buffer.isBuffer(h.speechToText.resolved[0].audio), 'audio 必须是 Buffer（内核落盘的 WAV）');
+  assert.equal(h.speechToText.transcribed.length, 1, '应调一次 transcribe');
+  assert.equal(h.agents.steered.length, 1, '应 steer 一条消息');
+  assertUserMessageShape(h.agents.steered[0].message);
+  assert.equal(h.agents.steered[0].message.content[0].text, '帮我把构建脚本跑一遍');
+  assert.equal(h.agents.steered[0].id, 's1', '注入给解析出来的目标会话');
+  assert.equal(h.agents.followed.length, 0, '默认走 steer，不该调 followup');
+  assert.deepEqual(h.removed, ['/tmp/asr/utt-000001.wav'], '识别完必须删掉临时录音');
+});
+
+await test('全双工防自注入①：识别结果与最近播报高度重合 → 不注入（真机踩过的回声）', async () => {
+  // 真机时间线：07:03:47 助手播报「明白，我先确认重启后的当前状态，再顺着问题往下排查。」
+  //            07:03:50 麦克风把它收回去，识别出同一句，被当成"用户说的话"注入 → 重复
+  const spoken = '明白，我先确认重启后的当前状态，再顺着问题往下排查';
+  const h = duplexHarness({
+    text: spoken,
+    recentSpeech: () => [{ text: spoken, at: Date.now() }],
+  });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/utt-000001.wav', id: 'utt-000001.wav', seconds: 3.2 });
+  assert.equal(outcome.status, 'echo-text', `应判定为回声，实际 ${outcome.status}`);
+  assert.equal(h.agents.steered.length, 0, '绝不能把自己念的内容注入会话');
+  assert.equal(h.duplex.stats().skipped, 1, '应计入 skipped');
+});
+
+await test('全双工防自注入②：用户真实的话不受影响（相似度不足则照常注入）', async () => {
+  const h = duplexHarness({
+    text: '把那个构建脚本再跑一遍看看',
+    recentSpeech: () => [{ text: '明白，我先确认重启后的当前状态，再顺着问题往下排查', at: Date.now() }],
+  });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/utt-000002.wav', id: 'utt-000002.wav', seconds: 2.0 });
+  assert.equal(outcome.status, 'injected', `不该误杀，实际 ${outcome.status}`);
+  assert.equal(h.agents.steered.length, 1);
+});
+
+await test('全双工防自注入③：识别结果与较早的播报重合 → 不拦（避免误杀用户复述）', async () => {
+  const spoken = '这一轮结束了';
+  const h = duplexHarness({
+    text: spoken,
+    // 40 秒前念过的：超出 20 秒比对窗口，应放行
+    recentSpeech: () => [{ text: spoken, at: Date.now() - 40000 }],
+  });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/utt-000003.wav', id: 'utt-000003.wav', seconds: 1.2 });
+  assert.equal(outcome.status, 'injected', `超窗口应放行，实际 ${outcome.status}`);
+});
+
+await test('全双工防自注入④：起于播放冷却窗内的句子直接丢弃（afterPlayback 标记）', async () => {
+  const h = duplexHarness({ text: '随便什么内容' });
+  const outcome = await h.duplex.handle({
+    path: '/tmp/asr/utt-000004.wav', id: 'utt-000004.wav', seconds: 2.5, afterPlayback: true,
+  });
+  assert.equal(outcome.status, 'echo-tail', `应判为回声尾巴，实际 ${outcome.status}`);
+  assert.equal(h.agents.steered.length, 0, '不该注入');
+});
+
+await test('全双工防自注入⑤：duplexEchoGuard=false 时关掉兜底（保留用户选择）', async () => {
+  const spoken = '明白，我先确认重启后的当前状态';
+  const h = duplexHarness({
+    text: spoken,
+    config: { duplexEchoGuard: false },
+    recentSpeech: () => [{ text: spoken, at: Date.now() }],
+  });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/utt-000005.wav', id: 'utt-000005.wav', seconds: 2.0 });
+  assert.equal(outcome.status, 'injected', `关掉兜底后应注入，实际 ${outcome.status}`);
+});
+
+await test('全双工②：同一句只注入一次（内核重发同一 id 不许注入两遍）', async () => {
+  const h = duplexHarness();
+  const event = { path: '/tmp/asr/utt-000007.wav', id: 'utt-000007.wav', seconds: 1.4 };
+  const first = await h.duplex.handle(event);
+  const second = await h.duplex.handle({ ...event });
+  assert.equal(first.status, 'injected');
+  assert.equal(second.status, 'duplicate', `第二次应判重复，实际 ${second.status}`);
+  assert.equal(h.agents.steered.length, 1, `只许注入一次，实际 ${h.agents.steered.length}`);
+  assert.equal(h.speechToText.transcribed.length, 1, '重复事件不该再识别一遍');
+  assert.deepEqual(h.removed, ['/tmp/asr/utt-000007.wav'], '重复事件不得删第一份还在用的文件');
+  assert.equal(h.duplex.stats().duplicates, 1);
+});
+
+await test('全双工③：识别失败只留痕，不抛错、不注入（绝不影响会话）', async () => {
+  const h = duplexHarness({ fail: true });
+  let outcome = null;
+  await assert.doesNotReject(async () => {
+    outcome = await h.duplex.handle({ path: '/tmp/asr/a.wav', id: 'a.wav' });
+  });
+  assert.equal(outcome.status, 'transcribe-failed');
+  assert.equal(h.agents.steered.length, 0, '识别失败不许注入');
+  assert.deepEqual(h.removed, ['/tmp/asr/a.wav'], '识别失败也要清掉临时录音');
+  assert.equal(h.duplex.stats().failed, 1);
+});
+
+await test('全双工④：录音文件缺失（ENOENT）不抛错、不注入', async () => {
+  const h = duplexHarness({ missingFile: true });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/gone.wav', id: 'gone.wav' });
+  assert.equal(outcome.status, 'read-failed');
+  assert.equal(h.speechToText.transcribed.length, 0, '读不到文件就不该去识别');
+  assert.equal(h.agents.steered.length, 0);
+  assert.equal(h.duplex.stats().failed, 1);
+});
+
+await test('全双工⑤：识别文本为空 / 语言不在白名单 → 都不注入且不抛', async () => {
+  const empty = duplexHarness({ text: '   ' });
+  assert.equal((await empty.duplex.handle({ path: '/tmp/asr/e.wav', id: 'e.wav' })).status, 'empty-text');
+  assert.equal(empty.agents.steered.length, 0, '空文本不许注入');
+
+  // resolve 抛错（官方 resolve 对白名单外的语言就是抛）也要被接住
+  const bad = duplexHarness({ config: { duplexLanguage: 'fr' } });
+  const outcome = await bad.duplex.handle({ path: '/tmp/asr/f.wav', id: 'f.wav' });
+  assert.equal(outcome.status, 'resolve-failed', `白名单外的语言应失败但不抛，实际 ${outcome.status}`);
+  assert.equal(bad.agents.steered.length, 0);
+});
+
+await test('全双工⑥：speechToText 不可用 → 通路安全关闭（available=false，不抛）', async () => {
+  const h = duplexHarness({ service: false });
+  assert.equal(h.duplex.available, false);
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/x.wav', id: 'x.wav' });
+  assert.equal(outcome.status, 'no-service');
+  assert.equal(h.agents.steered.length, 0);
+  assert.deepEqual(h.removed, ['/tmp/asr/x.wav'], '用不上的录音也要清掉，别堆在临时目录');
+});
+
+await test('全双工⑦：duplexInjectMode=followup 时走 followup，且 language 配置生效', async () => {
+  const h = duplexHarness({ config: { duplexInjectMode: 'followup', duplexLanguage: 'en' } });
+  const outcome = await h.duplex.handle({ path: '/tmp/asr/g.wav', id: 'g.wav' });
+  assert.equal(outcome.status, 'injected');
+  assert.equal(h.speechToText.resolved[0].language, 'en', 'language 应取配置值');
+  assert.equal(h.agents.followed.length, 1, '应调 followup');
+  assert.equal(h.agents.steered.length, 0, 'followup 模式下不该再 steer');
+  assert.equal(outcome.mode, 'followup');
+});
+
+await test('全双工⑧：目录外的路径一律拒绝（不读、不认领、不删）', async () => {
+  const h = duplexHarness({ utteranceDir: '/tmp/asr-own' });
+  // ⚠️ 刻意用 /tmp 之外的路径（且不写真实家目录，避免隐私检查误报）。
+  const outside = '/var/tmp/not-our-utterance/important.wav';
+  const outcome = await h.duplex.handle({ path: outside, id: 'important.wav' });
+  assert.equal(outcome.status, 'outside-dir');
+  assert.equal(h.read.length, 0, '不该去读目录外的文件');
+  assert.deepEqual(h.removed, [], '更不该删目录外的文件');
+  assert.equal(h.agents.steered.length, 0);
+});
+
 console.log('\n── 6. 配置解析 ──');
 await test('兼容 schemastery 访问器与普通值两种形状', () => {
   const accessor = { get: () => 42 };
@@ -420,6 +888,43 @@ await test('路径字段展开 ~（包内默认值要跨机器可用）', () => 
   assert.equal(cfg.logFile, `${home}/x.log`);
   assert.equal(cfg.cwd, `${home}/work`);
   assert.equal(cfg.engine, './engine/e.sh', './ 开头必须保留，留给 engine 按包根解析');
+});
+
+await test('barge-in 配置：默认值 + 钳制 + 路径展开（不改则与 v1.6.0 一致）', () => {
+  const cfg = resolveConfig({});
+  assert.equal(cfg.mode, 'off', 'mode 缺省是「原始」档：不启用双工，行为等价于没有双工');
+  assert.equal(cfg.audioCorePath, './engine/audio-core', '默认指向包内内核');
+  assert.equal(cfg.bargeInEnabled, true);
+  assert.equal(cfg.bargeInOverDb, 9);
+  assert.equal(cfg.bargeInOverDbPlaying, 14, '播放期用更严门限（防自打断）');
+  assert.equal(cfg.bargeInReleaseMs, 600);
+
+  const clamped = resolveConfig({ bargeInOverDb: -3, bargeInReleaseMs: -100, bargeInEnabled: false });
+  assert.equal(clamped.bargeInOverDb, 0, '负值钳到 0');
+  assert.equal(clamped.bargeInReleaseMs, 0, '负值钳到 0');
+  assert.equal(clamped.bargeInEnabled, false, '显式关掉要保留');
+  assert.equal(resolveConfig({ audioCorePath: '~/core' }).audioCorePath, `${os.homedir()}/core`, '路径字段要展开 ~');
+});
+
+await test('全双工配置：默认值 + 归一化（非法值一律回落默认）', () => {
+  const cfg = resolveConfig({});
+  assert.equal(cfg.duplexEnabled, true, '全双工默认开（只对 full 档生效）');
+  assert.equal(cfg.duplexLanguage, 'zh');
+  assert.equal(cfg.duplexInjectMode, 'steer', '用户已拍板：默认 steer（插进当前回合）');
+
+  assert.equal(resolveConfig({ duplexLanguage: '   ' }).duplexLanguage, 'zh', '空白回落 zh');
+  assert.equal(resolveConfig({ duplexLanguage: 'en' }).duplexLanguage, 'en');
+  assert.equal(resolveConfig({ duplexInjectMode: 'followup' }).duplexInjectMode, 'followup');
+  assert.equal(resolveConfig({ duplexInjectMode: 'nope' }).duplexInjectMode, 'steer', '非法值回落 steer');
+  assert.equal(resolveConfig({ duplexEnabled: false }).duplexEnabled, false, '显式关掉要保留');
+});
+
+await test('档位看门狗节拍：默认 1.5s、0=关闭、非 0 有下限（防热循环）', () => {
+  assert.equal(resolveConfig({}).modeWatchMs, 1500, '默认 1.5 秒一拍');
+  assert.equal(resolveConfig({ modeWatchMs: 0 }).modeWatchMs, 0, '0 = 关闭看门狗');
+  assert.equal(resolveConfig({ modeWatchMs: -5 }).modeWatchMs, 0, '负值按关闭处理');
+  assert.equal(resolveConfig({ modeWatchMs: 3 }).modeWatchMs, 50, '非 0 时钳到 50ms 下限');
+  assert.equal(resolveConfig({ modeWatchMs: 800 }).modeWatchMs, 800, '正常值原样');
 });
 
 await test('engine 路径解析：./ 相对包根、其余原样', () => {
@@ -580,6 +1085,36 @@ await test('enabled=false 时完全不注册监听', async () => {
   const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
   apply(ctx, { enabled: false });
   assert.equal(ctx.handlers.size, 0, '不该注册任何事件监听');
+  ctx.disposeAll();
+});
+
+// ⚠️ 这条守着一个设计缺陷：早期版本把 `mode: 'off'` 当成"关闭"、与 `enabled: false` 混为一谈，
+//    于是用户想回到"照旧播报"时只能去翻总开关。四档语义定下后：
+//    `off` = 原始档（照旧播报，只是不开双工）；`mute` = 真正停用。
+await test("mode='off'（原始档）仍然照旧播报，只是不启用双工", async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '原始档也要念这一句。' }) });
+  apply(ctx, baseConfig({ mode: 'off' }));
+  assert.ok(ctx.handlers.size > 0, '原始档必须注册监听（否则就是不播报了）');
+
+  const session = fakeSession();
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'user/message', data: { text: '随便干点活' } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash', input: {} } });
+  ctx.emit('session/event', session, { type: 'tool/result', data: {} });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1 } });
+  await tick(80);
+
+  assert.ok(subprocess.calls.length > 0, '原始档必须真的发声（走老路径：wrapper 自播）');
+  assert.equal(subprocess.coreCalls.length, 0, '原始档**不得**启用音频内核（不碰麦克风）');
+  ctx.disposeAll();
+});
+
+await test("mode='mute' 才是真正停用", async () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
+  apply(ctx, { mode: 'mute' });
+  assert.equal(ctx.handlers.size, 0, 'mute 档不该注册任何事件监听');
   ctx.disposeAll();
 });
 
@@ -1484,6 +2019,403 @@ await test('会话销毁会清掉该会话的待播定时器', async () => {
   await tick(120);
   assert.equal(subprocess.calls.length, 0, '会话销毁后不该还有播报');
   ctx.disposeAll();
+});
+
+console.log('\n── 8. 全双工端到端（mode: full，假宿主 + 真临时目录）──');
+
+/**
+ * 全双工端到端配置。
+ * ⚠️ `audioCorePath` 指向包内 shell 文件而不是编译产物：`engine/audio-core` 是编译出来的、
+ *    不入库，不能当测试前置条件（沿用 5c 已有的做法）。
+ */
+const FULL_CFG = { throttleMs: 0, minGapMs: 0, mode: 'full', audioCorePath: './engine/minimax-speak.sh' };
+
+/** 写一个**规范的** 16kHz 单声道 PCM16 WAV（44 字节头）到指定目录。 */
+function writeTestWav(dir, name, samples = 1600) {
+  const buffer = Buffer.alloc(44 + samples * 2);
+  buffer.write('RIFF', 0, 'ascii');
+  buffer.writeUInt32LE(36 + samples * 2, 4);
+  buffer.write('WAVE', 8, 'ascii');
+  buffer.write('fmt ', 12, 'ascii');
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(16000, 24);
+  buffer.writeUInt32LE(32000, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write('data', 36, 'ascii');
+  buffer.writeUInt32LE(samples * 2, 40);
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, buffer);
+  return file;
+}
+
+await test('全双工 e2e①：mode=full 时内核带 ASR_ENABLED/ASR_UTTERANCE_DIR，且目录已建好', () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText() });
+  apply(ctx, FULL_CFG);
+
+  assert.equal(subprocess.coreCalls.length, 1, 'full 档应起一个常驻内核');
+  const spec = subprocess.coreCalls[0];
+  assert.equal(spec.env?.ASR_ENABLED, '1', 'full 档必须让内核分句落盘');
+  const dir = spec.env?.ASR_UTTERANCE_DIR;
+  assert.ok(typeof dir === 'string' && dir.length > 0, `ASR_UTTERANCE_DIR 必须非空：${dir}`);
+  // ⚠️ 目录必须先建好：漏建的话内核每句都落盘失败，而事件里只说 utterance-failed —— 全双工静默失效。
+  assert.ok(fs.existsSync(dir), `录音目录必须已被建好：${dir}`);
+  ctx.disposeAll();
+});
+
+await test('全双工 e2e②：mode=half 不带 ASR 环境变量（半双工零回归）', () => {
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm() });
+  apply(ctx, { ...baseConfig(), mode: 'half', audioCorePath: './engine/minimax-speak.sh' });
+  assert.equal(subprocess.coreCalls.length, 1, 'half 档应起内核（只做 VAD）');
+  assert.equal(subprocess.coreCalls[0].env?.ASR_ENABLED, undefined, '半双工不许让内核分句');
+  assert.equal(subprocess.coreCalls[0].env?.ASR_UTTERANCE_DIR, undefined);
+  ctx.disposeAll();
+});
+
+await test('全双工 e2e③：内核报 utterance-file → 本地识别 → steer 注入（播报不受影响）', async () => {
+  const subprocess = fakeSubprocess({ stdoutText: '/tmp/spoken.mp3\n' });
+  const speechToText = fakeSpeechToText({ text: '把构建脚本再跑一遍' });
+  const agents = fakeAgents();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm(), agents, speechToText });
+  apply(ctx, FULL_CFG);
+
+  const session = fakeSession('sfull');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  // 内核侧：先真的写一个 WAV 到它自己的录音目录，再报事件 —— 走真实的读文件 + 删文件路径。
+  const dir = subprocess.coreCalls[0].env.ASR_UTTERANCE_DIR;
+  const wav = writeTestWav(dir, 'utt-000001.wav');
+  subprocess.kernels[0].stdout.write(`${JSON.stringify({ ev: 'utterance-file', path: wav, id: 'utt-000001.wav', seconds: 0.1, reason: 'silence' })}\n`);
+  await tick(40);
+
+  assert.equal(speechToText.resolved.length, 1, '内核报一句，就该识别一句');
+  assert.equal(speechToText.resolved[0].language, 'zh', 'language 必须是配置的 zh');
+  assert.equal(agents.steered.length, 1, '识别文本应经 steer 注入');
+  assertUserMessageShape(agents.steered[0].message);
+  assert.equal(agents.steered[0].message.content[0].text, '把构建脚本再跑一遍');
+  assert.equal(agents.steered[0].id, 'sfull', '注入给最近有活动的那条会话');
+  assert.equal(fs.existsSync(wav), false, '识别完要删掉临时录音');
+
+  // 同一句重发一次：不许注入两遍。
+  subprocess.kernels[0].stdout.write(`${JSON.stringify({ ev: 'utterance-file', path: wav, id: 'utt-000001.wav', seconds: 0.1, reason: 'silence' })}\n`);
+  await tick(20);
+  assert.equal(agents.steered.length, 1, `同一句只许注入一次，实际 ${agents.steered.length}`);
+  assert.equal(speechToText.transcribed.length, 1, '重复事件不该再识别一遍');
+
+  // 识别通路不许把播报搞哑：照旧走一轮播报。
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.ok(subprocess.calls.length >= 1, `全双工下播报仍要出声，实际 ${subprocess.calls.length}`);
+  ctx.disposeAll();
+});
+
+await test('全双工 e2e④：识别失败不抛错、不影响会话，播报照旧', async () => {
+  const subprocess = fakeSubprocess({ stdoutText: '/tmp/spoken.mp3\n' });
+  const speechToText = fakeSpeechToText({ fail: true });
+  const agents = fakeAgents();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm(), agents, speechToText });
+  apply(ctx, FULL_CFG);
+
+  const session = fakeSession('sfail');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  const dir = subprocess.coreCalls[0].env.ASR_UTTERANCE_DIR;
+  const wav = writeTestWav(dir, 'utt-000002.wav');
+  assert.doesNotThrow(() => {
+    subprocess.kernels[0].stdout.write(`${JSON.stringify({ ev: 'utterance-file', path: wav, id: 'utt-000002.wav', seconds: 0.1, reason: 'silence' })}\n`);
+  });
+  await tick(40);
+  assert.equal(agents.steered.length, 0, '识别失败不许注入');
+  assert.equal(fs.existsSync(wav), false, '识别失败也要清掉临时录音');
+
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.ok(subprocess.calls.length >= 1, `识别失败不许影响播报，实际 ${subprocess.calls.length}`);
+  ctx.disposeAll();
+});
+
+await test('全双工 e2e⑤：缺 speechToText 服务 → 只 warn + 留痕，内核照起、播报照旧', async () => {
+  const warns = [];
+  const logFile = path.join(os.tmpdir(), `dsh-stage-speak-duplex-${process.pid}-${Date.now()}.log`);
+  try { fs.rmSync(logFile, { force: true }); } catch { /* 忽略 */ }
+  const subprocess = fakeSubprocess({ stdoutText: '/tmp/spoken.mp3\n' });
+  // 刻意**不给** speechToText：模拟"没装语音 bundle 的机器"。
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm(), agents: fakeAgents() });
+  ctx.logger.warn = (message) => warns.push(String(message));
+  apply(ctx, { ...FULL_CFG, logFile });
+
+  assert.ok(warns.some((message) => message.includes('全双工已关闭')), `服务缺失必须 warn：${JSON.stringify(warns)}`);
+  const journalText = fs.readFileSync(logFile, 'utf8');
+  assert.ok(journalText.includes('duplex-unavailable'), `必须留痕（不然是静默失效）：\n${journalText}`);
+  assert.equal(subprocess.coreCalls.length, 1, '内核照起（半双工让路仍然可用）');
+  assert.equal(subprocess.coreCalls[0].env?.ASR_ENABLED, undefined, '没有识别服务就不该让内核分句落盘');
+
+  const session = fakeSession('snosvc');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.ok(subprocess.calls.length >= 1, `缺识别服务时播报必须照旧，实际 ${subprocess.calls.length}`);
+  ctx.disposeAll();
+  try { fs.rmSync(logFile, { force: true }); } catch { /* 忽略 */ }
+});
+
+await test('全双工防回退：inject 里不得出现 speechToText / agents', async () => {
+  const module = await import('../lib/index.js');
+  assert.deepEqual(module.inject, ['subprocess'], `inject 只该有 subprocess，实际 ${JSON.stringify(module.inject)}`);
+  for (const name of ['speechToText', 'agents']) {
+    assert.ok(!module.inject.includes(name),
+      `${name} 不能进 inject：cordis 的 inject 无 optional 语义，缺这一个服务会让整个插件不激活（连默认档播报都没了）`);
+  }
+});
+
+console.log('\n── 9. 配置热更新（拨档位不生效的真机缺陷）──');
+
+/**
+ * 造一个带**活配置**的假宿主：`ctx.fiber.config` 就是面板保存时被原地改写的那个对象。
+ *
+ * 真机机制（源码逐字读过）：`cordis-plugin-loader._commitVolatile()` 对 volatile 字段走快路径 ——
+ * 把新值 `updateVolatile(ref, source)` 写进 `fiber.config` 的活访问器，然后直接 return，
+ * **不重挂载插件、不重跑 apply**。所以插件只能自己比对活配置。
+ */
+function hotCtx({ subprocess, llm, agents, speechToText, liveConfig }) {
+  const ctx = fakeCtx({ subprocess, llm, agents, speechToText });
+  ctx.fiber = { config: liveConfig };
+  return ctx;
+}
+
+/** 热更新用例的活配置基线（看门狗 50ms，跑得快）。 */
+function liveCfg(overrides = {}) {
+  return {
+    throttleMs: 0,
+    minGapMs: 0,
+    mode: 'off',
+    modeWatchMs: 50,
+    audioCorePath: './engine/minimax-speak.sh',
+    ...overrides,
+  };
+}
+
+/** 收内核 stdin 上的命令（用来断言"旧内核有没有被 quit"）。 */
+function watchKernelCommands(kernel) {
+  const commands = [];
+  kernel.stdin.on('data', (chunk) => commands.push(String(chunk)));
+  return commands;
+}
+
+/** 建一个临时 journal 文件，返回路径与读取/清理器。 */
+function tempJournal(tag) {
+  const file = path.join(os.tmpdir(), `dsh-stage-speak-${tag}-${process.pid}-${Date.now()}.log`);
+  try { fs.rmSync(file, { force: true }); } catch { /* 忽略 */ }
+  return {
+    file,
+    read: () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''),
+    clean: () => { try { fs.rmSync(file, { force: true }); } catch { /* 忽略 */ } },
+  };
+}
+
+await test('热更新①：看门狗发现 mode off→full → 起内核且带 ASR_ENABLED（不必重启宿主）', async () => {
+  const subprocess = fakeSubprocess();
+  const live = liveCfg();
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { ...live });
+  assert.equal(subprocess.coreCalls.length, 0, '启动时是「原始」档，不该起内核');
+
+  live.mode = 'full'; // ← 等价于面板保存：只改活配置，apply 不再跑
+  await tick(200);
+
+  assert.equal(subprocess.coreCalls.length, 1, `看门狗应把内核起起来，实际 ${subprocess.coreCalls.length}`);
+  assert.equal(subprocess.coreCalls[0].env?.ASR_ENABLED, '1', 'full 档要让内核分句落盘');
+  assert.ok(String(subprocess.coreCalls[0].env?.ASR_UTTERANCE_DIR ?? '').length > 0, '并给出录音目录');
+  ctx.disposeAll();
+});
+
+await test('热更新②：看门狗发现 full→off → 旧内核被拆掉（收到 quit、不再有内核）', async () => {
+  const subprocess = fakeSubprocess();
+  const live = liveCfg({ mode: 'full' });
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { ...live });
+  assert.equal(subprocess.coreCalls.length, 1, 'full 档启动就该起内核');
+  const commands = watchKernelCommands(subprocess.kernels[0]);
+
+  live.mode = 'off';
+  await tick(200);
+
+  assert.ok(commands.join('').includes('"cmd":"quit"'), `旧内核必须收到 quit：${JSON.stringify(commands)}`);
+  assert.equal(subprocess.coreCalls.length, 1, '不该再起第二个内核');
+  // 切回原始档后播报照旧，且**不**再走"只合成不播放"的内核路径。
+  const session = fakeSession('shot');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.ok(subprocess.calls.length >= 1, `切档后播报仍要出声，实际 ${subprocess.calls.length}`);
+  assert.equal(subprocess.calls.at(-1).env?.MMX_SYNTH_ONLY, undefined, '原始档应回到 wrapper 自播');
+  ctx.disposeAll();
+});
+
+await test('热更新③：只改非关键键 → 不重建通路，但新值当场生效', async () => {
+  const subprocess = fakeSubprocess();
+  const journalFile = tempJournal('hot3');
+  const live = liveCfg({ mode: 'half', logFile: journalFile.file });
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { ...live });
+  assert.equal(subprocess.coreCalls.length, 1, 'half 档应起内核（只做 VAD）');
+  const commands = watchKernelCommands(subprocess.kernels[0]);
+  const journalText0 = journalFile.read();
+
+  // ⚠️ 只改**不影响调度**的非关键键：`throttleMs` 也是活配置，改大它会把播报推到 10 秒后，
+  //    那样这条用例就测不到播报了。`graceMs` 引擎在 spawn 时读它，正好能证明新值当场生效。
+  live.graceMs = 12345;
+  await tick(200);
+
+  assert.equal(subprocess.coreCalls.length, 1, '非关键键变化不该重建通路（更不该重启内核）');
+  assert.deepEqual(commands, [], '旧内核不该收到任何命令（尤其不许 quit）');
+  assert.equal(journalFile.read(), journalText0, '不该有新的重建留痕（journal 一个字都不该多）');
+
+  // 但配置本身必须热生效：重新播一次，spawn 规格里的 graceMs 应是新值。
+  const session = fakeSession('shot2');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.equal(subprocess.calls.at(-1)?.graceMs, 12345, '活配置里的 graceMs 必须当场生效');
+  ctx.disposeAll();
+  journalFile.clean();
+});
+
+await test('热更新④：ctx.fiber 不存在时不抛错，退回"启动时判定一次"', async () => {
+  const subprocess = fakeSubprocess();
+  // 刻意**不给** fiber：非 Loader 挂载 / 老宿主。
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText() });
+  let error = null;
+  try {
+    apply(ctx, { mode: 'full', modeWatchMs: 50, throttleMs: 0, minGapMs: 0, audioCorePath: './engine/minimax-speak.sh' });
+  } catch (thrown) {
+    error = thrown;
+  }
+  assert.equal(error, null, `没有 fiber 不许抛错：${error?.message}`);
+  await tick(200); // 让看门狗空转几拍
+
+  assert.equal(subprocess.coreCalls.length, 1, '退回启动时判定一次：一个内核，不多不少');
+  const session = fakeSession('snofib');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+  ctx.emit('session/event', session, { type: 'tool/call', data: { name: 'bash' } });
+  ctx.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await tick(80);
+  assert.ok(subprocess.calls.length >= 1, '播报照旧');
+  ctx.disposeAll();
+});
+
+await test('热更新⑤：loader/volatile-update 事件即时生效（看门狗关掉也能切档）', async () => {
+  const subprocess = fakeSubprocess();
+  const live = liveCfg({ modeWatchMs: 0 }); // 关掉看门狗 → 只剩事件这条路
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { ...live });
+  assert.equal(subprocess.coreCalls.length, 0);
+
+  live.mode = 'full';
+  ctx.emit('loader/volatile-update', [['mode']]);
+  await tick(30);
+
+  assert.equal(subprocess.coreCalls.length, 1, '事件应即时触发重建（不必等轮询）');
+  ctx.disposeAll();
+});
+
+await test('热更新⑥：活配置是访问器形状（DSH 就是写活访问器）时同样能发现变化', async () => {
+  const subprocess = fakeSubprocess();
+  let mode = 'off';
+  // 模拟 updateVolatile：值存在访问器里，热更新改写的是访问器的值。
+  const live = { ...liveCfg(), mode: { get: () => mode } };
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { mode: 'off', modeWatchMs: 50, throttleMs: 0, minGapMs: 0, audioCorePath: './engine/minimax-speak.sh' });
+  assert.equal(subprocess.coreCalls.length, 0);
+
+  mode = 'full';
+  await tick(200);
+  assert.equal(subprocess.coreCalls.length, 1, '访问器形状的活配置同样要被读到');
+  ctx.disposeAll();
+});
+
+await test('热更新⑦：只改 duplexLanguage → 只换识别半边，内核不重启、不重复挂监听', async () => {
+  const subprocess = fakeSubprocess();
+  const speechToText = fakeSpeechToText({ text: '换语言之后照样识别' });
+  const agents = fakeAgents();
+  const live = liveCfg({ mode: 'full' });
+  const ctx = hotCtx({ subprocess, llm: fakeLlm(), agents, speechToText, liveConfig: live });
+  apply(ctx, { ...live });
+  assert.equal(subprocess.coreCalls.length, 1);
+
+  live.duplexLanguage = 'en';
+  await tick(200);
+  assert.equal(subprocess.coreCalls.length, 1, '只改语言不该重启内核（省掉重新起麦+校准）');
+
+  // 注入目标 =「最近有活动的会话」，所以先喂一条会话事件（否则会因 no-target 拒绝注入）。
+  const session = fakeSession('slang');
+  ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+
+  // 内核侧照旧报一句 → 必须**只**被处理一次（重复挂监听会让同一句进两次）。
+  const dir = subprocess.coreCalls[0].env.ASR_UTTERANCE_DIR;
+  const wav = writeTestWav(dir, 'utt-000009.wav');
+  subprocess.kernels[0].stdout.write(`${JSON.stringify({ ev: 'utterance-file', path: wav, id: 'utt-000009.wav', seconds: 0.1, reason: 'silence' })}\n`);
+  await tick(40);
+
+  assert.equal(speechToText.resolved.length, 1, `同一句只该识别一次，实际 ${speechToText.resolved.length}`);
+  assert.equal(speechToText.resolved[0].language, 'en', '新语言必须已生效');
+  assert.equal(agents.steered.length, 1, '同一句只该注入一次');
+  ctx.disposeAll();
+});
+
+await test('热更新⑧：来回切换多轮不泄漏内核（每轮恰好一个新内核，旧的都收到 quit）', async () => {
+  const subprocess = fakeSubprocess();
+  const journalFile = tempJournal('hot8');
+  // ⚠️ logFile 要写进**同一个** live 对象：给 ctx.fiber.config 传副本的话，
+  //    后面 `live.mode = ...` 就改不到插件真正读的那个对象了。
+  const live = liveCfg({ logFile: journalFile.file });
+  const ctx = hotCtx({
+    subprocess, llm: fakeLlm(), agents: fakeAgents(), speechToText: fakeSpeechToText(), liveConfig: live,
+  });
+  apply(ctx, { ...live });
+
+  const quitFlags = [];
+  let watched = 0;
+  for (const mode of ['full', 'off', 'full']) {
+    live.mode = mode;
+    await tick(200);
+    // 起新内核的那一轮才登记监听（切回 `off` 时不产生新内核 —— 这正是要验证的）。
+    if (subprocess.kernels.length > watched) {
+      watched = subprocess.kernels.length;
+      quitFlags.push(watchKernelCommands(subprocess.kernels.at(-1)));
+    }
+  }
+  // 三轮切换：full 起 1 个 → off 拆掉 → full 再起 1 个 = 共 2 个内核。
+  assert.equal(subprocess.coreCalls.length, 2, `每轮只该有一个新内核，实际 ${subprocess.coreCalls.length}`);
+  assert.ok(quitFlags[0].join('').includes('"cmd":"quit"'), '第一个内核被切走时必须收到 quit');
+  assert.deepEqual(quitFlags.at(-1), [], '最后那个内核是当前在用的，不该收到 quit');
+
+  const journalText = journalFile.read();
+  const changes = journalText.split('\n').filter((line) => line.includes('duplex-mode-changed'));
+  // 三次切换（off→full→off→full）各留一条痕（启动那次不算变化）。
+  assert.equal(changes.length, 3, `三次档位变化要各留一条痕，实际 ${changes.length}：\n${journalText}`);
+  assert.ok(changes[0].includes('from=off|kernel=0|duplex=0'), `留痕要带 from：${changes[0]}`);
+  assert.ok(changes[0].includes('to=full|kernel=1|duplex=1'), `留痕要带 to：${changes[0]}`);
+  assert.ok(changes.every((line) => line.includes('trigger=watchdog')), `留痕要带触发来源：\n${changes.join('\n')}`);
+  ctx.disposeAll();
+  journalFile.clean();
 });
 
 console.log(`\n${'─'.repeat(48)}`);

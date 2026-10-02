@@ -1,5 +1,459 @@
 # CHANGELOG
 
+## V1.8.2 — 2026-10-02 · 修「自己听见自己」：防自注入两层防御
+
+**来源**：全双工真机首次跑通时立刻暴露（journal 有完整时间线）：
+
+```
+07:03:45  你说「我已经重启了。」      → 触发 kickoff
+07:03:47  助手播报「明白，我先确认重启后的当前状态…」
+07:03:50  duplex-injected  steer  我已经重启了。我已经重启了。   ← 助手自己的播报被收回去了
+```
+
+即：**助手播报 → 麦克风收回去 → 识别成"用户说的话" → 重复注入会话**。
+
+### 根因
+
+内核的严格门限（`VAD_OVER_DB_PLAYING=14`）与播放起点宽限期（0.4s）**只在播放期间生效**。
+而识别是**滞后**的：回声尾巴落在播放结束之后，那时播放标志已回到 false、门限降回安静档（+9dB），
+于是被当成用户说话。这正是"没有 ASR 的半双工档无法根除误触发"那个固有极限的**必然残留**。
+
+### 修法：两层防御（缺一不可）
+
+| 层 | 位置 | 做法 |
+|:--|:--|:--|
+| 1 | 内核 `audio-core.swift` | 新增**播放结束冷却窗**（`VAD_PLAYBACK_COOLDOWN`，默认 **1.5s**）：窗内**维持播放期的严格判定**。并给起于窗内的句子打 `afterPlayback: true` 标记 |
+| 2 | 插件 `lib/duplex.js` | **与"最近念过的文本"做相似度比对**（字符二元组 Dice 系数，阈值 0.72，窗口 20s）：识别结果字面上就是刚念的内容 → 丢弃 |
+
+第 2 层的**关键设计**：只跟 20 秒内念过的比。更早的内容被用户复述是合理行为，不该误杀（有用例③守着）。
+取不到比对素材时**放行**——宁可漏挡一次回声，也不要误杀用户真实说的话。
+
+新增开关 `duplexEchoGuard`（默认开，已在面板）：关掉时**两层一起关**（否则"关了还在拦"，用户会以为开关坏了）。
+
+### 验证（新增 5 条用例，全部为真机场景复刻）
+
+```
+✓ 防自注入①：识别结果与最近播报高度重合 → 不注入（复刻 07:03:50 那条真机日志）
+✓ 防自注入②：用户真实的话不受影响（相似度不足则照常注入）
+✓ 防自注入③：与较早（40s 前）的播报重合 → 不拦，避免误杀用户复述
+✓ 防自注入④：起于播放冷却窗内的句子直接丢弃（afterPlayback 标记）
+✓ 防自注入⑤：duplexEchoGuard=false 时两层一起关
+```
+
+`node test/offline.mjs` **132 / 132**（V1.8.1 的 127 条全过 + 新增 5）；
+`client-harness` 通过（面板 **38** 字段）；`smoke-audio-core` 通过；`check-secrets` 干净；`node --check` 全过。
+
+### 真机验收（2026-10-02，用户确认）
+
+用户重启后连说多轮，**全双工正常、不再重复注入**。journal 同时留痕：
+
+```
+duplex-injected  steer  我先暂停一下。          ← 识别准确
+duplex-injected  steer  嗯继续。你继续。
+duplex-mode-changed  from=full|kernel=1|duplex=1 to=off|kernel=0|duplex=0 trigger=volatile-update
+```
+
+最后一行同时证明**拨档位即时生效**（不必重启宿主）也通过真机验收。
+
+## V1.8.1 — 2026-10-02 · 拨档位当场生效（配置是原地热更新，插件只读了一次）
+
+**来源**：真机缺陷 —— 用户重启宿主后（journal `ready … duplex=off`）在面板把「双工档位」从
+「原始」拨到「全双工」并保存：`cordis.patch.yml` 里**确实写入了 `mode: full`**，
+但**没有内核进程**、journal 里也再没有 `duplex=*` 行 —— 双工根本没起来，必须重启宿主才行。
+
+### 根因（源码逐行核对，不是推测）
+
+面板保存**不是**"改配置 → 重挂载插件"，而是走了 `cordis-plugin-loader` 的 **volatile 快路径**：
+
+```js
+// cordis-plugin-loader/lib/index.js —— Entry._commitVolatile()
+const refs = volatileEntries(fiber.config);          // ← 从 fiber.config 里取出 volatile 访问器引用
+const candidate = resolveConfig(fiber.runtime, ...); // 归一化后的候选配置
+const paths = refs.flatMap(({ path, ref }) => {
+  const source = path.reduce((value, key) => Reflect.get(value, key), candidate);
+  if (deepEqual(ref.get(), source.get(), true)) return [];
+  updateVolatile(ref, source);                       // ← 把新值**原地写进活访问器**
+  return [path];
+});
+if (!paths.length) return true;                      // → return true
+// 调用方：const pending = volatileOnly && this._commitVolatile() ? [] : changes;
+//         if (!pending.length && !force) return;    // ← 直接返回：**不重挂载、不重跑 apply**
+```
+
+而 `lib/index.js` 的 `apply()` 在启动时把 `mode` 读了一次就算好了 `wantBargeIn` / `wantDuplex`，
+之后再也不看 —— 所以拨档位对运行中的插件毫无作用。
+（`mode` / `bargeInEnabled` / `duplexEnabled` 全都是 `.volatile()` 字段，正好走这条快路径。）
+
+### 改动
+
+| # | 文件 | 改动 |
+|:--|:--|:--|
+| 1 | `lib/index.js` | ① 新增 `liveConfigSource()`：优先读 `ctx.fiber?.config`（= 面板保存时被原地改写的那个活对象），取不到（非 Loader 挂载 / 没有 fiber / 代理抛错）**回落 `apply` 时的原始入参**；两条路都仍经 `resolveConfig()` 归一化，不绕过配置契约。② 「档位 → 要不要内核 / 要不要全双工」抽成纯函数 `pathState()`，通路建立/拆除改成**可重入**的 `buildPath()` / `teardownPath()`（复用既有 `duplex.dispose()` / `audioCore.dispose()` / `engine.dispose()`）。③ 新增差分刷新 `refreshPath(trigger)`：只有通路指纹（`mode` / `bargeInEnabled` / `duplexEnabled`）变化才拆旧建新；只改 `duplexLanguage` / `duplexInjectMode` 时**只重建 duplex**（内核不重启 —— 免得白花 2–3.5 秒重新起麦+校准）。④ 新增 `modeWatchMs` 低频看门狗（默认 1500ms，`ctx.effect` + `setInterval`，随插件卸载清掉；置 0 = 关闭）。⑤ 同时订阅 `loader/volatile-update`（见下）走同一套幂等差分。⑥ 每次刷新把归一化后的配置**就地** `Object.assign` 回 `config`，于是面板的"改配置热生效"对**所有**字段都成立（此前只有启动时读的那一次）。⑦ 判定写 journal：`duplex-mode-changed from=… to=… trigger=…`、`duplex-params-changed …`。 |
+| 2 | `test/offline.mjs` | 新增 9 条（8 条热更新 + 1 条节拍钳制）：见"验证"。`fakeCtx` 之外的 `hotCtx()` 会挂上 `ctx.fiber.config` 活配置；`liveCfg()` / `watchKernelCommands()` / `tempJournal()` 为新增小工具。 |
+| 3 | `CHANGELOG.md` | 本条。 |
+| 4 | 版本 | 1.8.0 → **1.8.1**（`package.json` 由 Lead 统一处理）。 |
+
+**未改**：`lib/audio-core.js`、`lib/duplex.js`、`lib/client.js`、`engine/*`、`package.json` 一行未动
+（重入只需要在 `index.js` 里换引用，不需要动那两个模块）。
+
+### 为什么是"看门狗 + 事件"两条腿（对根因说明的一处修正）
+
+准确说：**没有任何"配置已变更"的公开事件可订阅** —— `internal/config` 只是解析期 waterfall
+（谁都能挂，但那是配置解析路径本身），`internal/update` 只在整插件重载时走。
+**但是** volatile 快路径在写完之后会自己发一个 `loader/volatile-update`（按 fiber 过滤后送达本插件）。
+
+所以落地为：
+- **看门狗是保证**（1.5s 差分轮询）—— 不依赖任何内部事件，DSH 将来改了内部行为也照样生效；
+- **事件是加速** —— 收到就地比对，切档位是"立刻"而不是"最多 1.5 秒后"。
+两条走**同一个** `refreshPath()`，指纹差分是幂等的，重复触发无害。
+两者都失效时最坏退化成"启动时判定一次"（= 修复前的行为），**播报始终不受影响**。
+
+### 验证（全部本机实跑）
+
+- `node test/offline.mjs` → **127 / 127**（V1.8.0 基线 118 条全过 + 新增 9 条）
+- `node test/client-harness.mjs` → 通过（字段仍是 37 个：`modeWatchMs` 有意不加 `.volatile()`，不进面板）
+- `node scripts/check-secrets.mjs` → 干净；`node --check` 全部文件 OK
+- **真机机制探针（真 cordis + loader 用的同一对 `volatileEntries`/`updateVolatile`）**：
+  把插件挂到**真 cordis Context** 上，用 `updateVolatile` 原地改写活访问器（= 面板保存做的事），
+  **不重挂载、不重跑 apply**：
+
+  ```
+  fiber.config 是对象: true | 键数: 43
+  fiber.config.mode: {} | 是访问器: true          ← 活配置确实是访问器对象
+  启动档位 mode = off | 启动时内核数 = 0 (off 档应为 0)
+  —— ① 事件路径（复刻 loader 的 loader/volatile-update 发送方式）——
+  updateVolatile 改动的路径: [["mode"]] | 改完 fiber.config.mode = full
+  300ms 后内核数 = 1 | ASR_ENABLED = 1           ← 事件那条路真的通（看门狗默认 1.5s）
+  —— ② 看门狗路径（只改活配置、不发事件）——
+  只改活配置、不发事件：mode = full
+  2.2s 后内核数 = 2（+1）| ASR_ENABLED = 1        ← 没有任何事件，靠差分轮询也起来了
+  —— journal 留痕 ——
+      duplex-mode-changed from=off|kernel=0|duplex=0 to=full|kernel=1|duplex=1 trigger=volatile-update
+      duplex-mode-changed from=full|kernel=1|duplex=1 to=off|kernel=0|duplex=0 trigger=volatile-update
+      duplex-mode-changed from=off|kernel=0|duplex=0 to=full|kernel=1|duplex=1 trigger=watchdog
+  ```
+
+  这一条等价于"面板保存"的完整链路（真 cordis、真访问器、真热更新函数），只差宿主重启那一步。
+- 新增的 9 条离线用例：
+  ① 看门狗 off→full → 起内核且带 `ASR_ENABLED`/`ASR_UTTERANCE_DIR`
+  ② full→off → 旧内核收到 `quit`、不再有第二个内核，且播报回到 wrapper 自播
+  ③ 只改非关键键（`graceMs`）→ **不**重建通路（journal 一个字不多、内核一条命令不收），但新值当场生效
+  ④ `ctx.fiber` 不存在 → 不抛错、退回"启动时判定一次"
+  ⑤ `modeWatchMs: 0`（关掉看门狗）时，`loader/volatile-update` 事件仍能即时切档
+  ⑥ 活配置是**访问器形状**（DSH 的真实形状）时同样能发现变化
+  ⑦ 只改 `duplexLanguage` → 内核不重启，且同一句仍**只**被处理/注入一次（证明没重复挂 `utterance-file` 监听）
+  ⑧ 来回切三轮不泄漏内核：恰好 2 个内核、被切走的那个收到 `quit`、当前这个一条命令都不收
+  ⑨ `modeWatchMs` 默认 1500 / 0=关闭 / 非 0 钳到 50ms 下限
+
+### 仍未验证（如实记录）
+
+- ~~**真机重启后的面板实测**没做~~ → **已完成**（2026-10-02）：真机拨档位当场生效，
+  journal 出现 `duplex-mode-changed … trigger=volatile-update`。
+- `modeWatchMs` 默认 1.5s ⇒ 关掉事件路径时切档位最坏延迟 1.5s；有事件时是即时的。
+- 面板点「保存」若同时改了 volatile 与非 volatile 字段，loader 会走**整插件重载**（`apply` 重跑），
+  这条路径本来就正常，本次没动它。
+
+
+## V1.8.0 — 2026-10-02 · 全双工接线（`mode: 'full'`：开口 → 让路 → 本地识别 → 注入当前回合）
+
+**来源**：用户拍板 ——「你开口说话 → 播报停下 → **本地识别** → 文本作为用户消息**插进当前回合**」，
+识别引擎用**本地 SenseVoice**（`ctx.speechToText`），注入方式用 **steer**。
+本次只做**接线**：内核（AEC + VAD + 分句落盘）与本地识别服务都已就绪并单独验证过，
+`engine/audio-core.swift` / `engine/audio-core` **一行未动**。
+
+### 改动
+
+| # | 文件 | 改动 |
+|:--|:--|:--|
+| 1 | `lib/audio-core.js` | ① `utterance-file` 事件**显式派发**并计数（`stats().utterances`），新增命名回调 `onUtteranceFile`。⚠️ 事件名到回调名改为**显式映射表** —— `utterance-file` 带连字符，靠"首字母大写"拼会得到 `onUtterance-file`。② `config.asrEnabled === true` 时下发 `ASR_ENABLED=1` + `ASR_UTTERANCE_DIR`，**并先把目录建好**（默认 `mkdtempSync(tmpdir()/dsh-stage-speak-asr-)`；也可用内部字段 `asrUtteranceDir` 指定）。③ 客户端新增 `.utteranceDir`；`dispose()` 清掉**自己建的**临时目录（调用方指定的目录一律不删），且该清理放在 `alive` 判断**之外**（内核崩溃时 `markDead` 早已把 `alive` 置 false，跟着早退就永远清不掉）。 |
+| 2 | `lib/duplex.js`（新增） | 全双工的「识别 → 注入」半边：读 WAV → `speechToText.resolve({audio, language})` → `transcribe(spec, signal)` → `agent.steer/followup(完整 UserMessage)` → 删临时录音。含：**按句 id 去重**、目录外路径拒绝（不读也不删）、60 秒看门狗、`dispose()` 真的 `abort` 在飞识别。`handle()` **永不 reject**，只返回 `{status}` 供日志与测试。 |
+| 3 | `lib/index.js` | ① `wantBargeIn` 从 `half` 扩到 `half`/`full`；② 新增 `wantDuplex`（`full` + `duplexEnabled !== false`）；③ 新增 `createDuplex` 接线：内核 `utterance-file` → `duplex.handle()`；④ 注入目标是**最近有活动的那条会话**（`duplexTargetId`，会话销毁即清空）；⑤ 三个新配置 `duplexEnabled` / `duplexLanguage` / `duplexInjectMode`；⑥ `ready` 日志加 `+asr` / `+asr-off`；⑦ 卸载时补上 `audioCore.dispose()`（此前遗漏 → 插件重载会漏下一个仍占着麦克风的内核进程）。 |
+| 4 | `lib/client.js` | 「核心」组新增 3 个字段（开关 / 语言 / 注入方式）；`full` 档说明从"尚未实现，先选中不生效"改为实际行为；顺手修正 `bargeInEnabled` 的"只在半双工档起作用"（现在两档都起作用）。 |
+| 5 | `test/offline.mjs` | 新增 15 条用例（8 条 `lib/duplex.js` 单测 + 1 条配置归一化 + 5 条端到端 + 1 条**防回退**）；`fakeSubprocess` 把内核的双向管道记进新增的 `kernels[]`，`fakeCtx` 支持 `agents` / `speechToText` 两个可选服务。 |
+| 6 | `test/client-harness.mjs` | 面板字段数 34 → **37**（switch 11→12 / input 21→22 / select 1→2），并新增"能点到「全双工」档位"用例。 |
+| 7 | 版本 | 1.7.1 → **1.8.0**（`package.json` 由 Lead 统一处理）。 |
+
+### 根因 / 设计取舍（为什么这么做）
+
+1. **🔴 为什么不把 `speechToText` / `agents` 写进 `export const inject`（别顺手改回去）** ——
+   **因为 cordis 的 `inject` 没有 optional 语义，缺一个服务即整个插件不激活**：
+   `Fiber._refresh()` 对 inject 里**每一个**名字都要求 store 里有实现，缺一个就把 epoch 置
+   `INACTIVE`，而 `_setEpoch()` 只在 `epoch !== INACTIVE` 时才 `_reload()`（才执行 `apply`）。
+   本机实测（把 `@deepseek-ai/cordis` 从 app.asar 解出来后跑最小复现）：
+
+   | 场景 | 结果 |
+   |:--|:--|
+   | `plugin.inject = ['ghostService']`，服务缺失 | **`apply` called: false**（插件根本不激活） |
+   | 同上，服务后续出现 | 此时才 `apply called: true`（在此之前**静默死**） |
+   | 不 inject，`ctx.get('ghostService')` | `undefined`（安全） |
+   | 不 inject，直接读 `ctx.ghostService` | 在场可读；不在场抛 `cannot get property "x" without inject` |
+
+   所以字面写进 `inject` 的代价是：**任何没装语音 bundle 的机器上，连默认档 `off` 的播报都没了**
+   —— 双工只是**可选增强**，不能拿主功能做抵押，更不能破坏本仓库「任何失败只记日志、
+   绝不影响会话」的底线，以及 V1.7.0 半双工的零回归。
+   落地方式：`inject` 保持 `['subprocess']`，两个可选服务一律走 `ctx.get()`（cordis 源码注释：
+   *Read a service from the store without the inject requirement*）；取不到时 **warn + journal
+   `duplex-unavailable`**，双工通路关闭、播报照旧。
+   并加了一条**防回退断言**（`test/offline.mjs`）：`inject` 里出现 `speechToText` 或 `agents` 即测试失败。
+
+2. **识别不放在内核里**：内核只有 MiniMax **云端** ASR 的老路径；本地 SenseVoice 由宿主提供，
+   只有 Node 侧拿得到（`ctx.speechToText`）。所以内核只做"落盘 + 报路径"，不认识识别服务。
+3. **必须先建录音目录**：目录不存在时内核每句都落盘失败，而事件只说 `utterance-failed`
+   —— 表现为"全双工静默失效、什么错都看不到"。故 `createAudioCore` 在 spawn **之前**建目录。
+4. **注入必须是完整 UserMessage**：`dsh-session` 的 `assertMessageEventShape()` 要求
+   `id` 非空 string、`role === 'user'`、`source.kind` 非空 string、`content` 是数组；
+   传纯字符串会在 `user/message` 事件落库时被直接拒（已逐字读过该函数）。
+5. **去重按句 id**：内核重发/重放同一 `utterance-file` 时不许注入两遍；且重复事件**不删文件**
+   （第一份还在读，删了会让那次识别失败）。
+
+### 契约已核实（来自 app.asar 解出的官方源码，逐条读过，不是推测）
+
+- `speechToText.transcribe(spec, signal)` 返回 **`{ text: string, audioSeconds: number, inferenceSeconds: number }`**
+  （sensevoice provider 的 `transcriptSchema` 是 zod `.strict()`）。
+- `resolve({audio, language})` 对语言有**白名单校验**，provider `info.languages = ['auto','zh','en','yue','ja','ko']`，
+   名单外的值会**抛** `does not support language` → 故 `duplexLanguage` 默认 `zh`，且失败被 `duplex.js` 接住留痕。
+- `transcribe` 的第二参 `signal` **必填**（官方实现第一行就是 `signal.throwIfAborted()`）。
+- 内核 `wavData()` 写的是**规范 44 字节头**（RIFF / `fmt ` 16 / 1ch / 16000 / 32000 / 2 / 16 / `data`），
+  与官方 `validateWave()` 的逐字段要求吻合。
+- `Agent` 接口：`steer(message: UserMessage)` / `followup(message: UserMessage)`；官方 API 路径
+  （`dsh-api-session-controller`）的 `prompt({ mode: 'steer' })` 用的正是
+  `{ content: [{ type:'text', text }], source: { kind:'user' } }` 这条形状。
+
+### 验证（全部本机实跑）
+
+- `node test/offline.mjs` → **118 / 118**（基线 103 条全过 + 新增 15 条）
+- `node test/client-harness.mjs` → 通过（字段 37 个：switch 12 / input 22 / select 2 / mode 1）
+- `node test/smoke-audio-core.mjs` → 通过（⚠️ 需显式传一个**当前缓存里存在**的 mp3：
+  脚本里写死的 `004fee86…mp3` 已被缓存清理删掉，与本版改动无关；
+  `node test/smoke-audio-core.mjs ~/.cache/dsh-stage-speak/3329fb2d…mp3` → `✓ 协议冒烟测试全部通过`）
+- `node --check` → `lib/*.js` / `test/*.mjs` / `scripts/*.mjs` 全 OK
+- **真机内核探针（真内核 + 真外放，非替身）**：
+  - `ASR_ENABLED=1 ASR_UTTERANCE_DIR=<临时目录> ./engine/audio-core` → `ready` 事件里
+    **`"asrEnabled":true`**（证明环境变量名与内核读取逻辑完全对上，不只是替身测试）；
+  - 内核跑起来后**外放一段已知 mp3**（同 `test/asr-e2e.mjs` 的做法），内核依次报
+    `voice → silence → utterance-file`，事件字段正是 `["ev","id","path","reason","seconds"]`；
+  - 落盘的 `utt-000001.wav`（142444 字节 / 4.45 秒）**通过官方 `validateWave()`**
+    （从 app.asar 解出的 `@deepseek-ai/dsh-experimental-speech-to-text/wave` 原样调用）
+    —— 即"内核产出的 WAV 就是识别服务接受的规范 16kHz 单声道 PCM16 WAV"这条**实测成立**，不是推断。
+- ✅ **真机已验证**（2026-10-02）：`mode: 'full'` 的"真人说话 → 注入到会话"整段通过 ——
+  journal 出现 `duplex-injected … steer <识别文本>`，会话里确实多出一条以用户名义的消息。
+  本次覆盖到的是：内核分句落盘（真机）→ 事件契约（真机 + 替身）→ 识别调用形状（替身，按官方源码逐字对齐）
+  → UserMessage 注入形状（替身，按 `assertMessageEventShape` 逐条断言）；**唯一缺口是"宿主里的
+  `ctx.speechToText` 真的被调到、且 `agent.steer` 真的进了会话"**。
+
+
+## V1.7.1 — 2026-10-01 · 把「原始档」独立出来（四档语义）
+
+**来源**：用户指出 ——「应该保留一个原始档位：不加任何双工状态下，按原来那样工作也能正常运行」。
+
+### 问题（真实的档位设计缺陷）
+
+V1.6.0 把 `mode: 'off'` 接线成**等价于 `enabled: false`**（不注册任何监听、完全停用）。
+但"**照旧念**"和"**别念了**"是两件根本不同的事，混成一个档导致：
+用户想回到"没有双工"的原始行为时，只能去翻总开关 —— 而面板上明明摆着一个"关闭"档。
+
+### 改动：四档语义各自独立
+
+| 档位 | 含义 | 麦克风 | 内核 |
+|:--|:--|:--|:--|
+| **`off` 原始**（新默认） | 照旧播报，行为与 v1.5.1 完全一致 | 不启用 | 不启动 |
+| `half` 半双工 | 你一开口就让路 | 启用 | 启动 |
+| `full` 全双工 | 尚在规划 | — | — |
+| **`mute` 静音**（新增） | 完全停用（= 原 `off` 的语义） | 不启用 | 不启动 |
+
+- 默认值 `half` → **`off`**：不拨开关时就是原来那样（用户要的正是这个）。
+- 面板第一档改名「**原始**」，并新增「静音」档；档位映射改为查表（`MODE_LABEL_KEY` / `MODE_HINT_KEY`），
+  避免"新加一档忘了改渲染"这类错。
+
+### 测试防回退（新增 2 条，共 103 条）
+
+- `mode='off'`（原始档）**必须照旧播报**、且 `coreCalls` 为空（**不得**启动内核 / 碰麦克风）
+- `mode='mute'` 才是真正停用（不注册任何监听）
+
+### 验证
+
+`npm test` **103 / 103**；`node test/client-harness.mjs` 通过（34 字段 / 4 档 radio）；
+`node test/smoke-audio-core.mjs` 通过；`node --check` 全部文件 OK。
+
+
+## V1.7.0 — 2026-10-01 · 半双工 barge-in 接线（Swift 音频内核接入）
+
+**来源**：V1.6.0 面板上的 `half`（半双工）此前是"可选、未接线"。本次把它接到
+`engine/audio-core`（Swift 常驻音频内核）：**你开口说话时，播报立刻停下让路**。
+内核本身（AEC + 自适应 VAD + 播放）已在 V1.6.0 期间做好并单独验证过，本次只做**接线**，
+不改 `engine/audio-core.swift` 的行为。
+
+### 改动
+
+| # | 文件 | 改动 |
+|:--|:--|:--|
+| 1 | `engine/minimax-speak.sh` | 新增 **`MMX_SYNTH_ONLY=1`：只合成不播放**。该模式不 `afplay`，把 mp3 **绝对路径**打到 stdout 一行；缓存命中同样只交路径；失败回退**不出声**，改为 stderr + 非零退出码（让 Node 侧知道"没合成出来"）。默认（不设该变量）行为逐字不变。 |
+| 2 | `lib/audio-core.js`（新增） | 音频内核子进程客户端。同步工厂 `createAudioCore()`：校验内核存在 → `ctx.subprocess.spawn`（**cwd 必填**、stdin/stdout 都 `'pipe'`）→ 挂 stdout 逐行解析 JSON Lines。导出 `on(kind,fn)` / `play(path,id)` / `stop(reason)` / `dispose()` / `stats()`；`bargeInOverDb`→`VAD_OVER_DB`、`bargeInReleaseMs`→`VAD_RELEASE_FRAMES`（1024 帧 @48k ≈ 21.33ms/帧）。内核不存在 / spawn 抛错 / 没有双向管道 → **返回 null 并 warn**。 |
+| 3 | `lib/engine.js` | `createSpeechEngine` 新增可选 `deps.audioCore` 与 `deps.onBargeIn`，并新增 `interrupt(reason)`。给了内核 → "wrapper 合成（synth-only）→ 内核播放"；没给 → 与 V1.5.1 **完全一致**（wrapper 自播）。内核报 `voice` → 先调 `onBargeIn(event)`，再由引擎自己 `interrupt('barge-in')`。high 优先级插队现在也会打断内核播放（`kernelPlaying`）。 |
+| 4 | `lib/index.js` + `Config` | 新增 4 个字段：`audioCorePath`（默认 `./engine/audio-core`，与 `engine` 同约定，`./` 相对包根）· `bargeInEnabled`（默认 true）· `bargeInOverDb`（9）· `bargeInReleaseMs`（600）。`mode === 'half' && bargeInEnabled !== false` 时启用内核；内核不可用只 warn、退回原路径；收到 barge-in 写一条 `barge-in` journal。`ready` 日志新增 `duplex=half+kernel` 字段。 |
+| 5 | `test/offline.mjs` | 假 subprocess 服务把**双向管道** spawn（音频内核）单独记进 `coreCalls`，`calls` 仍只记单向播报子进程；新增 7 条用例（见"验证"）。 |
+| 6 | 版本 | 1.6.0 → **1.7.0**（`package.json` 由 Lead 统一处理）。 |
+
+### 根因 / 设计约束（为什么这么做）
+
+1. **播报必须交给内核播，不能继续 `afplay`**：只有内核播出来的声音才在它自己的
+   AVAudioEngine 里，AEC 才拿得到回声参考；`afplay` 播的声音内核"看不见"，会被它自己的
+   VAD 当成"用户在说话"→ 一播就自打断。所以 wrapper 必须增加"只合成"模式。
+2. **`createAudioCore` 必须是同步工厂**：`apply()` 要同步注册事件监听，若为了等内核就绪把它
+   变成 async，加载期的事件会丢。所以只做同步可判定的检查（存在性 + spawn 同步抛错），
+   运行期失败（管道断开 / 内核崩溃）走 `stats().alive === false` + 事件回调降级。
+3. **`SubprocessSpawnSpec.cwd` 必填**：漏了 spawn 会同步抛错且很容易被吞掉 = 完全静默失败。
+   客户端里显式 `cwd` + `try/catch`，并由单测钉住。
+4. **测试替身要区分两类子进程**：内核在 `apply()` 时就拉起、是常驻进程。若它混进
+   `subprocess.calls`，所有"播报了几次"的断言都会被它污染（实测 27 条用例失败）。
+   按"是否需要双向管道"分流后，94 条既有断言的字面与含义都**未改**。
+
+### 验证（全部本机实测）
+
+- `npm test` → **101 / 101 通过**（既有 94 条全绿 + 新增 7 条：①audioCore 为 null 走老路径
+  ②给了 audioCore 走 synth-only + 内核播放 ③`voice` → `onBargeIn` + `interrupt`（清队列、内核收 `stop`）
+  ④`interrupt` 清空队列且不抛错（有/无内核）⑤内核不存在 → null + warn ⑥JSON Lines 派发 +
+  play/stop/quit 协议 + VAD 环境变量换算 ⑦barge-in 配置默认值/钳制/路径展开）。
+- `node test/smoke-audio-core.mjs` → 协议冒烟全通过（ready / 完整播放 finished / 1ms 打断 / 干净退出）。
+- **wrapper synth-only 离线实测**（把假 `afplay` 放 PATH 上，不发声）：
+  `MMX_SYNTH_ONLY=1` 缓存命中 → stdout 打绝对路径、exit 0、**afplay 未被调用**；
+  不带该变量 → stdout 为空、**afplay 被调用**（老行为不变）；
+  `MMX_SYNTH_ONLY=1` 且无 Key → **exit 1、stderr 有说明、不出声**。
+- **真实内核 + 新客户端联调**（一次性探针，非单测）：`ready → calibrated → started → finished`、
+  `stop` 后（即便已播完）仍收到 `stopped`、`dispose` 干净退出，`stats().voices=1`。
+- `node --check`：`lib/*.js`、`test/*.mjs`、`scripts/*.mjs` 全部通过。
+
+### 遗留 / 边界
+
+- **自打断风险（未定论，需听感验证）**：真实播放期间麦克风电平确实被抬高
+  （受控实验：静默期约 -55 dBFS，播放期在 -30 ~ -43 dBFS）。受控对照里**没有**自触发 `voice`，
+  但两次单发运行各出现过一次"播放期内的 `voice`"（-46.5 / -38.6）。是否稳定取决于环境噪声、
+  音量与 `VAD_OVER_DB`；建议用真人开口做一次听感验证并微调阈值（属内核调参，不在本次改动范围）。
+- `full`（全双工 ASR）仍未接线。
+- 改 `audioCorePath` / `bargeIn*` 后需让插件重新 `apply`（配置热生效会重跑 apply）；改
+  `lib/*.js` 代码则**需重启宿主**。
+- 新增的 4 个字段**未加进插件页面板**（`lib/client.js` 是 V1.6.0 手写 bundle，本次刻意不动）；
+  它们仍可在通用设置页改。
+
+
+### 补记：Lead 复核时补的三处（同一版本内）
+
+1. **关闭 voice processing 自带 AGC**（内核默认改）：实测它把静音期电平从 **-54 抬到 -32 dBFS（+22 dB）**，
+   把"环境噪声"和"说话"一起放大，自适应门限失去意义。关掉后电平才是线性的。
+2. **播放期用更严的触发门限**：新增 `bargeInOverDbPlaying`（默认 14 dB；安静期仍 9 dB），
+   并在播放开始后加 **0.4s 宽限期**。依据：受控实测外放的回声抬升约 **5.5 dB**，
+   而你插话时离麦克风很近、电平远高于此 —— 用更严的门限把"自己念给自己听"挡在外面。
+3. **面板补齐 4 个 barge-in 参数**（`bargeInEnabled` / `bargeInOverDb` / `bargeInOverDbPlaying` /
+   `bargeInReleaseMs`），让用户在自己的声学环境里按听感调参。
+
+### 未根除的风险（必须如实记录）
+
+**没有 ASR 的半双工档存在固有极限：仅靠电平无法区分"你在说话"与"环境噪声 / 残余回声"。**
+实测环境噪声本身可达 -40 dBFS（接近说话电平），因此**自打断（误触发）无法从原理上根除**。
+本版的取舍是：**误触发只导致"少念一句"，不产生任何破坏性动作**；并把调参交给用户。
+若需根治，只能等全双工档接入 ASR 后用品类判定（识别出文本才算真插话）。
+
+## V1.6.0 — 2026-10-01 · 插件页配置面板（开关 + 双工档位 + 全部 30 个可配字段）
+
+**来源**：用户提出两件事——① "能不能给播报插件一个开关，选择打开还是关闭播报"；
+② "既然在做面板，是不是应该把所有可调整项都做进去"。②的判断依据是实测：
+**34 个配置字段里 30 个早就标了 `volatile()`**，即它们**一直**在设置页可改，只是挤在一张
+扁平键值表里、标题是机器命名（`kickoffThrottleMs` 这种）。所以面板的价值不是"增加可配置项"，
+而是**分组、中文标签、说明、当前值可见、一键恢复默认**。
+
+### 改动
+
+| # | 改动 |
+|:--|:--|
+| 1 | **新增浏览器半边** `lib/client.js`：手写 bundle（无构建步骤），在插件页注册 `plugins.bundle.config` 卡片 |
+| 2 | 面板把 30 个字段分五组：**核心**（5）· **念什么**（5）· **声音与摘要**（7）· **节奏**（9）· **高级**（4） |
+| 3 | **一个开关管总闸**：`enabled`；再加**三档双工开关** `mode`（关 / 半双工 / 全双工） |
+| 4 | **一键恢复全部默认**：遍历 30 个字段调用 `resetField`，这是原设置页做不到的 |
+| 5 | 宿主侧新增 `mode` 字段（`union(['off','half','full'])`，默认 `half`），并接入总开关判定：**`mode: 'off'` 与 `enabled: false` 等价** |
+| 6 | `package.json`：`dsh.client = { platform: 'web', inject: [locale, ui-primitives, ui-plugin-manager, ui-settings] }` + `./client` 导出；版本 1.5.1 → **1.6.0** |
+
+### 明确不做的
+
+- **4 个技术字段不进面板**：`engine`（引擎路径）· `cwd`（子进程工作目录）——配错就彻底哑掉；
+  `logFile` · `toolErrorIgnoreCodes` —— 纯排障用。它们仍在设置页可改。
+- **`half` / `full` 只做"可选、不接线"**：`off` 立即生效；`half`/`full` 目前按"正常播报"处理。
+  双工行为的实现见工作区 `V1.0_播报插件全双工改造技术方案.md`。
+
+### 两条实测结论（写面板时踩到/查到的）
+
+1. **`SwitchField` / `TextAreaField` 不是官方控件** —— 官方 `primitives` 只给 `Switch`、`Tag`
+   这类原子件，字段行得插件自己拼。
+2. **配置表单模型只认文本字段** —— 布尔要用 `"true"/"false"` 转义，数字/联合类型同理；
+   非法值必须返回 `undefined`（= 不写入），否则脏字符串会进配置。
+
+### 首次上线失败的三个真实根因（2026-10-01 当轮修复）
+
+第一版面板装上去后**插件页不出现配置卡**，浏览器控制台报
+`props.useStageSpeakCard is not a function` + `slot entry crashed in 'plugins.bundle.config'`。
+逐条查实如下：
+
+| # | 根因 | 证据 / 出处 | 修法 |
+|:--|:--|:--|:--|
+| 1 | **hook 键名多写了 `use`** | 宿主渲染器 `standardHookPropName(name)` = `` `use${name[0].toUpperCase()}${name.slice(1)}` `` —— 它**自动加前缀**。写 `useStageSpeakCard` 被翻成 `useUseStageSpeakCard`，组件拿到 undefined | 键名改为 `StageSpeakCard`（对照：`dsh-reveal-context` 用的是 `revealContextCard`） |
+| 2 | **违规 `require('@deepseek-ai/dsh-client-ui-primitives')`** | 官方 App 内文档 `dsh-agent-preset/skills/cordis-plugin-development/references/practices.md` §UI 明文禁止：`dsh.client.inject` **只排序激活、不提供模块**；这些包说变就变，组件一抛错就整块空掉 | **改为原生控件**（自写 `role="switch"` 开关、`input`、`select`、三档 radio），只共享 `--dsw-alias-*` token；不再 require 任何 Harness 包 |
+| 3 | 误以为 slot 注册要用 `id` | 官方模板 `templates/decoration/client.js` 用的是 `id`，但那是 **list slot**；`plugins.bundle.config` 是 **keyed slot**（`ctx.slots.register` 源码：`case "keyed": if (options.key === undefined) throw`） | 保持 `key: PLUGIN_ID`（原本就对） |
+
+**顺带查实的两个事实**（避免以后再走弯路）：
+
+- `ctx.configForms.get(id)` 返回的 `ConfigFormController` **自带 `getSnapshot()` 与 `subscribe()`**，
+  正好满足渲染器 `bindSnapshotSelector` 要求的 `{ getSnapshot, subscribe }` 契约 ——
+  所以 `hooks: { StageSpeakCard: form }` 直接成立，不需要另造 store。
+- 面板不再用官方 `SettingsForm`；保存 / 放弃 / 恢复默认由面板自己调
+  `form.mutate(ops, revision)`（一次提交多个字段的 `set` / `unset`）完成。
+
+### 第四个根因：`whileServed` 门禁导致「静默不注册」（2026-10-01 二次修复）
+
+改完前三个根因后**面板依然完全不出现，且控制台没有任何本插件的报错**。对照本机
+**能正常出面板的 `dshmarket`**（用户安装后其面板立刻出现）才找到真因：
+
+```js
+// 我的写法（错）：注册被 whileServed 包住
+ctx.effect(() => ctx.configForms.whileServed([PLUGIN_ID], () => ctx.slots.inject(...)))
+// dshmarket 的写法（对）：无条件直接注册
+ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register({ name, key: PKG_NAME, locale, inject }, Card))
+```
+
+`whileServed` 的语义是「宿主设置镜像里出现该命名空间时才注册」。**条件不成立时它既不注册、
+也不报错** —— 外部看到的现象就是"插件页里什么都没有 + 控制台干净"，属最难定位的一类失败。
+
+**修法**：去掉门禁，改为无条件注册；并照 dshmarket 补上**显式自诊断**（取表单失败、
+缺 `getSnapshot`、注册抛错三类都 `logger.warn` + `console.warn`，绝不静默）。
+
+**测试防回退**：`test/client-harness.mjs` 的 `whileServed` 桩改成**一调用就抛错**，
+这条断言从此钉住"不许再用门禁包住注册"。
+
+`dshmarket` 的另外两点参考（本次未采纳，理由如下）：
+
+- 它**直接 `require("@deepseek-ai/dsh-client-ui-primitives")` 且工作正常** —— 说明
+  `practices.md` 那条禁令不是硬运行时约束。本插件仍坚持自写原生控件（依赖更少、更抗版本漂移），
+  但要知道"require primitives 本身不致死"。
+- 它自带 `missingPrimitives(mod)` 检查，缺控件时 `console.warn` 并**优雅停用自己**，
+  而不是让组件抛错把槽位打空。这个"先检查再使用"的模式值得所有 UI 插件照抄。
+
+### 官方文档位置（下次写 DSH 插件先去读）
+
+App 内自带、无需联网：
+`/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/`
+→ `dsh/node_modules/@deepseek-ai/dsh-agent-preset/skills/cordis-plugin-development/`
+（`SKILL.md` + `references/{host-plugin,ui-plugin,practices,verification,user-actions,mcp-bundle}.md`
++ `templates/decoration/` 的最小可跑模板）。这套文档此前被忽略，是本次绕远路的主因。
+
+### 验证
+
+- `node --check` 通过；`npm test`（离线用例）**94 / 94 通过**，含 `mode: 'off'` 的零回归断言。
+- **`test/client-harness.mjs`（新增）**：用桩件在 Node 里真实执行浏览器半边，断言
+  ①只 require `react`（挡住"又去加载 Harness 包"）②slot 注册名 / key 正确
+  ③hook 键名不带 `use` 且转换后存在 ④渲染出 30 个字段（switch 10 / input 18 / select 1 / mode 1）
+  ⑤未改动时保存禁用、能点到第三档。**改面板先跑它，不必每次重启宿主。**
+- 字典对称性自检：zh / en 各 87 键，完全对称。
+- 字段覆盖自检：宿主 34 字段中，面板接入 30 个，未接入的正是上面刻意排除的 4 个。
+- ⚠️ 界面渲染仍须**目视确认**（GUI 客户端模块接口需鉴权，我读不到）。
+
 ## V1.5.1 — 2026-10-01 · 规则兜底仍在断言「没有卡住」
 
 **来源**：用户指出（承接 v1.4.2 立下的「只陈述可证实的事实」）。v1.4.0 那次只改了**模型人设**，
