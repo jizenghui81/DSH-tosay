@@ -1,6 +1,6 @@
 {
   "name": "dsh-stage-speak",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "description": "DSH 阶段摘要语音播报：阶段边界念一句人话；插件页配置面板；四档双工（原始/半双工/全双工/静音），半双工开口即让路，全双工本地识别+注入会话",
   "license": "MIT",
   "type": "module",

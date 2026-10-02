@@ -554,6 +554,35 @@ await test('内核路径④：interrupt 清空队列且不抛错（有/无内核
   kernel.dispose();
 });
 
+await test('内核自动构建：编译产物缺失时后台触发一次构建（且只试一次）', async () => {
+  // `engine/audio-core` 是编译产物、不入库 → 克隆出来的安装包里没有它。
+  // 修复前只有一条 warn，用户得自己回去读日志找构建脚本；现在首次用到就自己编。
+  //
+  // ⚠️ 这里**不能**让测试真去敲编译器（慢、且依赖本机工具链）。用替身挡住：
+  //    只要断言"被调用过、参数对、且失败也不抛"，就守住了这段逻辑。
+  const fakeSpawn = { calls: [] };
+  const { createAudioCore } = await import('../lib/audio-core.js');
+  const logs = [];
+  const core = createAudioCore({
+    subprocess: { spawn: () => { throw new Error('不该走到内核 spawn'); }, resolveExecutable: async (c) => c },
+    logger: { warn: (m) => logs.push(m) },
+    // 指向一个**一定不存在**的内核路径，逼出"缺失"分支
+    config: { audioCorePath: '/nonexistent/dir/audio-core' },
+    // 注入替身：自动构建走它，而不是真编译器
+    spawnBuild: (command, args, options) => {
+      fakeSpawn.calls.push({ command, args, options });
+      return { unref: () => {} };
+    },
+  });
+  assert.equal(core, null, '本次仍要优雅降级（播报照旧走原路径）');
+  assert.equal(fakeSpawn.calls.length, 1, '应触发一次后台构建，实际 ' + fakeSpawn.calls.length);
+  assert.ok(fakeSpawn.calls[0].args[0].endsWith('build-audio-core.sh'),
+    '应调用构建脚本，实际 ' + fakeSpawn.calls[0].args[0]);
+  assert.equal(fakeSpawn.calls[0].options.detached, true, '必须脱钩，否则会拖住插件生命周期');
+  assert.equal(fakeSpawn.calls[0].options.stdio, 'ignore', '构建输出不该污染插件的 stdio');
+  assert.ok(logs.some((m) => m.includes('已在后台构建')), '要留日志，否则用户不知道发生了什么');
+});
+
 await test('内核客户①：内核不存在时返回 null 并留日志（优雅降级）', () => {
   const warns = [];
   const core = createAudioCore({
@@ -1826,6 +1855,65 @@ await test('多会话音色（方案A）：第一个会话主音色，新开的�
   await tick(80);
   const last = subprocess.calls.at(-1);
   assert.ok(!(last.env ?? {}).MMX_VOICE, '主音色空出来后，新会话要拿回主音色');
+  ctx.disposeAll();
+});
+
+await test('多会话音色：voiceAlt 可填多个 → 3 个会话不撞音色（修复 ≥3 会话回绕）', async () => {
+  // 修复前：只支持"主 + 一个备用"，第 3 个会话会撞上第 2 个的音色，分不清谁在说。
+  const ALT_A = 'Chinese (Mandarin)_Radio_Host';
+  const ALT_B = 'Chinese (Mandarin)_Warm_Girl';
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '在跑。' }) });
+  apply(ctx, {
+    throttleMs: 0, minGapMs: 0, silenceHeartbeatMs: 0, announceKickoff: false,
+    voice: 'Lilian', voiceAlt: `${ALT_A}, ${ALT_B}`, turnEndMinToolCalls: 1,
+  });
+  const announce = (session) => {
+    ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+    ctx.emit('session/event', session, {
+      type: 'todo/write',
+      data: { todos: [{ content: 'x', status: 'completed' }] },
+    });
+  };
+  for (const id of ['session-A', 'session-B', 'session-C']) {
+    announce(fakeSession(id));
+    await tick(80);
+  }
+  const specs = subprocess.calls;
+  assert.equal(specs.length, 3, `三个会话各应播一次：${specs.length}`);
+  const voices = specs.map((call) => (call.env ?? {}).MMX_VOICE ?? '(主音色)');
+  assert.deepEqual(voices, ['(主音色)', ALT_A, ALT_B],
+    `三个会话应拿到三个不同音色，实际 ${JSON.stringify(voices)}`);
+  // 关键：前三个互不相同（这正是修复目标）
+  assert.equal(new Set(voices).size, 3, '三个会话必须三个音色，不能回绕重复');
+  ctx.disposeAll();
+});
+
+await test('多会话音色：备用音色用满后回绕，且不抛错（第 4 个会话）', async () => {
+  const ALT = 'Chinese (Mandarin)_Radio_Host';
+  const subprocess = fakeSubprocess();
+  const ctx = fakeCtx({ subprocess, llm: fakeLlm({ text: '在跑。' }) });
+  apply(ctx, {
+    throttleMs: 0, minGapMs: 0, silenceHeartbeatMs: 0, announceKickoff: false,
+    voice: 'Lilian', voiceAlt: ALT, turnEndMinToolCalls: 1,
+  });
+  const announce = (session) => {
+    ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+    ctx.emit('session/event', session, {
+      type: 'todo/write',
+      data: { todos: [{ content: 'x', status: 'completed' }] },
+    });
+  };
+  for (const id of ['session-A', 'session-B', 'session-C', 'session-D']) {
+    announce(fakeSession(id));
+    await tick(60);
+  }
+  const specs = subprocess.calls;
+  assert.equal(specs.length, 4, '四个会话都该播报（回绕但不出错）');
+  assert.ok((specs[0].env ?? {}).MMX_VOICE === undefined, '第一个仍是主音色');
+  for (const call of specs.slice(1)) {
+    assert.equal((call.env ?? {}).MMX_VOICE, ALT, '备用音色只有一个时，其余会话复用它是预期行为');
+  }
   ctx.disposeAll();
 });
 
